@@ -88,16 +88,24 @@ services:
 
   # Đăng ký Debezium connector tự động sau khi kafka-connect sẵn sàng
   connector-init:
-    image: curlimages/curl:8.5.0
+    image: confluentinc/cp-kafka:7.4.0
     container_name: connector-init
     volumes:
       - ./debezium:/connectors
-    command: ["-X", "POST", "http://kafka-connect:8083/connectors",
-              "-H", "Content-Type: application/json",
-              "-d", "@/connectors/postgres-connector.json"]
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+          --topic users_created --partitions 1 --replication-factor 1
+        curl -s -X POST http://kafka-connect:8083/connectors \
+          -H "Content-Type: application/json" \
+          -d @/connectors/postgres-connector.json
     networks:
       - confluent
     depends_on:
+      broker:
+        condition: service_healthy
       kafka-connect:
         condition: service_healthy
     restart: on-failure
