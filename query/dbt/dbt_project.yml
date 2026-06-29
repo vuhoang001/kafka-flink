@@ -1,0 +1,23 @@
+name: realtime_streaming
+version: '1.0.0'
+profile: realtime_streaming
+
+model-paths: ["models"]
+test-paths: ["tests"]
+
+models:
+  realtime_streaming:
+    +file_format: iceberg
+
+    bronze:
+      +materialized: view      # view thẳng vào Bronze Iceberg table
+      +schema: bronze_views    # schema trong Trino để phân biệt
+
+    silver:
+      +materialized: incremental
+      +incremental_strategy: merge
+      +schema: silver
+
+    gold:
+      +materialized: table
+      +schema: gold

@@ -1,93 +1,113 @@
-# ingest-data
+# Realtime Data Streaming Pipeline
 
-
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Pipeline xử lý dữ liệu real-time theo **Medallion Architecture** (Bronze → Silver → Gold).
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.foxai.com.vn/hoangtv/ingest-data.git
-git branch -M main
-git push -uf origin main
+Kafka → Flink → Bronze ──(dbt 15 phút)──► Silver ──► Gold
+                  │                                    │
+            query real-time                    query business
+            (30s latency)                      (processed)
 ```
 
-## Integrate with your tools
+---
 
-* [Set up project integrations](https://gitlab.foxai.com.vn/hoangtv/ingest-data/-/settings/integrations)
+## Tài liệu
 
-## Collaborate with your team
+| Tài liệu | Mô tả |
+|----------|-------|
+| [Kiến trúc](docs/architecture.md) | Sơ đồ tổng quan, luồng data, lý do chọn công nghệ |
+| [Cài đặt & Khởi động](docs/setup.md) | Hướng dẫn chạy từng bước, verify, rebuild |
+| **Layers** | |
+| [Bronze](docs/layers/bronze.md) | Raw data — schema, query operational data |
+| [Silver](docs/layers/silver.md) | Clean data — incremental merge, deduplication |
+| [Gold](docs/layers/gold.md) | Business data — join, aggregation, lineage |
+| **Components** | |
+| [Flink](docs/components/flink.md) | JAR cần thiết, pipeline config, tuning |
+| [Kafka & Debezium](docs/components/kafka.md) | Topics, CDC format, quản lý connector |
+| [Trino](docs/components/trino.md) | Query guide, time travel, metadata tables |
+| [dbt](docs/components/dbt.md) | Materialization, incremental, troubleshooting |
+| [Ingestion](docs/components/ingestion.md) | FastAPI, Airflow DAG, CDC |
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+---
 
-## Test and Deploy
+## Cấu trúc thư mục
 
-Use the built-in continuous integration in GitLab.
+```
+realtime-data-streaming/
+├── ingestion/
+│   ├── api/                    # FastAPI — HTTP push vào Kafka
+│   └── dags/
+│       ├── kafka_stream.py     # Airflow: pull randomuser.me → Kafka (hàng ngày)
+│       └── dbt_pipeline.py     # Airflow: chạy dbt Bronze→Silver→Gold (15 phút)
+├── cdc/
+│   └── postgres-connector.json # Debezium CDC config
+├── processing/
+│   └── flink/
+│       └── user_processor.py   # Flink job: Kafka → Bronze Iceberg
+├── storage/
+│   └── postgres/
+│       └── init.sql            # Schema + CREATE DATABASE nessiedb
+├── query/
+│   ├── trino/etc/              # Trino config + catalog
+│   ├── dbt/
+│   │   └── models/
+│   │       ├── bronze/         # View → Bronze tables
+│   │       ├── silver/         # Incremental merge (clean)
+│   │       └── gold/           # Full rebuild (business)
+│   └── duckdb/
+│       └── query_minio.py      # Query MinIO trực tiếp (không cần Trino)
+└── docs/
+    ├── architecture.md
+    ├── setup.md
+    ├── layers/
+    │   ├── bronze.md
+    │   ├── silver.md
+    │   └── gold.md
+    └── components/
+        ├── flink.md
+        ├── kafka.md
+        ├── trino.md
+        ├── dbt.md
+        └── ingestion.md
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+---
 
-***
+## Quick Start
 
-# Editing this README
+```bash
+# 1. Khởi động
+docker compose up -d
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# 2. Submit Flink job (ghi vào Bronze)
+docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
 
-## Suggestions for a good README
+# 3. Đẩy data
+curl -X POST http://localhost:8000/users -H "Content-Type: application/json" \
+  -d '{"first_name":"Test","last_name":"User","gender":"male","postcode":"100000",
+       "email":"test@example.com","username":"testuser",
+       "dob":"1995-01-01T00:00:00Z","phone":"0901234567"}'
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+# 4. Đợi 30s, query Bronze (operational)
+docker exec -it trino trino \
+  --execute "SELECT * FROM iceberg.bronze.api_users_raw ORDER BY ingested_at DESC LIMIT 5"
 
-## Name
-Choose a self-explaining name for your project.
+# 5. Chạy dbt → Silver + Gold
+cd query/dbt && dbt run --profiles-dir .
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+# 6. Query Gold (processed)
+docker exec -it trino trino \
+  --execute "SELECT * FROM iceberg.gold.users_enriched LIMIT 5"
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+---
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## UI
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+| Service       | URL                        |
+|---------------|----------------------------|
+| API Swagger   | http://localhost:8000/docs |
+| Flink Web UI  | http://localhost:18081     |
+| MinIO Console | http://localhost:9001      |
+| Trino Web UI  | http://localhost:8080      |
+| Nessie        | http://localhost:19120     |

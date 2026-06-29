@@ -1,3 +1,7 @@
+-- Database riêng cho Nessie (Iceberg catalog metadata)
+-- Phải tạo trước khi Nessie khởi động
+CREATE DATABASE nessiedb;
+
 -- Bảng users: đây là source table mà Debezium sẽ theo dõi CDC
 CREATE TABLE users (
     id         SERIAL PRIMARY KEY,

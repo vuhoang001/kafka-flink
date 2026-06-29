@@ -47,7 +47,7 @@ services:
     # wal_level=logical bắt buộc để Debezium đọc được WAL
     command: postgres -c wal_level=logical
     volumes:
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./storage/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - confluent
     healthcheck:
@@ -91,7 +91,7 @@ services:
     image: confluentinc/cp-kafka:7.4.0
     container_name: connector-init
     volumes:
-      - ./debezium:/connectors
+      - ./cdc:/connectors
     entrypoint: /bin/bash
     command:
       - -c
@@ -150,10 +150,79 @@ services:
         condition: service_healthy
 
   # ─────────────────────────────────────────
+  # NESSIE - Iceberg REST catalog (metadata)
+  # ─────────────────────────────────────────
+  nessie:
+    image: projectnessie/nessie:0.76.3
+    container_name: nessie
+    ports:
+      - "19120:19120"   # API: http://localhost:19120/iceberg
+    environment:
+      # Dùng PostgreSQL làm backing store (persist khi restart)
+      # nessiedb tách riêng khỏi mydb để tránh conflict với Debezium WAL
+      NESSIE_VERSION_STORE_TYPE: JDBC
+      QUARKUS_DATASOURCE_DB_KIND: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/nessiedb
+      QUARKUS_DATASOURCE_USERNAME: postgres
+      QUARKUS_DATASOURCE_PASSWORD: postgres
+    networks:
+      - confluent
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:19120/q/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # TRINO - SQL query engine đọc Iceberg
+  # ─────────────────────────────────────────
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    ports:
+      - "8080:8080"   # Web UI + JDBC: http://localhost:8080
+    volumes:
+      - ./query/trino/etc:/etc/trino
+    networks:
+      - confluent
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # USER INGEST API (FastAPI)
+  # ─────────────────────────────────────────
+  api:
+    build: ./ingestion/api
+    container_name: user-api
+    ports:
+      - "8000:8000"
+    networks:
+      - confluent
+    depends_on:
+      broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
   # FLINK CLUSTER
   # ─────────────────────────────────────────
   flink-jobmanager:
-    build: ./flink_job
+    build: ./processing/flink
     container_name: flink-jobmanager
     hostname: flink-jobmanager
     command: jobmanager
@@ -168,7 +237,7 @@ services:
         s3.secret-key: minio123
         s3.path.style.access: true
     volumes:
-      - ./flink_job:/opt/flink/jobs
+      - ./processing/flink:/opt/flink/jobs
     networks:
       - confluent
     depends_on:
@@ -178,7 +247,7 @@ services:
         condition: service_healthy
 
   flink-taskmanager:
-    build: ./flink_job
+    build: ./processing/flink
     container_name: flink-taskmanager
     hostname: flink-taskmanager
     command: taskmanager

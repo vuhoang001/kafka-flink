@@ -1,0 +1,23 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: "Raw data từ Flink streaming job, chưa qua xử lý"
+    database: iceberg
+    schema: bronze
+    tables:
+      - name: api_users_raw
+        description: "Raw data từ API (randomuser.me hoặc POST /users)"
+        columns:
+          - name: ingested_at
+            description: "Thời điểm Flink ghi vào Bronze, dùng để incremental load"
+
+      - name: cdc_users_raw
+        description: "Raw CDC events từ PostgreSQL qua Debezium"
+        columns:
+          - name: op
+            description: "Loại operation: c=create, u=update, d=delete, r=read(snapshot)"
+          - name: source_ts_ms
+            description: "Timestamp của transaction trong PostgreSQL"
+          - name: ingested_at
+            description: "Thời điểm Flink ghi vào Bronze"

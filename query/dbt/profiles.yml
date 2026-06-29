@@ -1,0 +1,12 @@
+realtime_streaming:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      host: localhost
+      port: 8080
+      database: iceberg   # tên catalog Trino = tên file iceberg.properties
+      schema: bronze       # default schema (override per-model trong dbt_project.yml)
+      threads: 4
+      prepared_statements_enabled: false
