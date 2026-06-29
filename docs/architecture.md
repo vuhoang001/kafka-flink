@@ -77,9 +77,10 @@ MinIO Object Storage (:9000 API / :9001 Console)
         ├── gold/users_enriched/data/*.parquet
         └── gold/user_stats/data/*.parquet
 
-I/O impl: S3FileIO (iceberg-aws-bundle)
-  s3.path-style-access = true  → vd: http://minio:9000/warehouse/bronze/...
-  warehouse prefix: s3://      → KHÔNG dùng s3a://
+I/O impl   : S3FileIO (từ iceberg-aws-bundle)
+scheme     : s3://warehouse/  (KHÔNG phải s3a://)
+path-style : true  (MinIO yêu cầu path-style, không hỗ trợ virtual-hosted)
+endpoint   : http://minio:9000
 ```
 
 ## Quyết định thiết kế
