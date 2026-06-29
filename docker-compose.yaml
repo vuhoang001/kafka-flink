@@ -150,6 +150,44 @@ services:
         condition: service_healthy
 
   # ─────────────────────────────────────────
+  # SPARK CLUSTER - xử lý Bronze → Silver → Gold
+  # ─────────────────────────────────────────
+  spark-master:
+    build: ./processing/spark
+    container_name: spark-master
+    hostname: spark-master
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "7077:7077"    # Spark master port (spark-submit connect vào đây)
+      - "8090:8080"    # Spark Web UI: http://localhost:8090
+    volumes:
+      - ./processing/spark/jobs:/opt/spark/jobs
+    networks:
+      - confluent
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  spark-worker:
+    build: ./processing/spark
+    container_name: spark-worker
+    hostname: spark-worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+    volumes:
+      - ./processing/spark/jobs:/opt/spark/jobs
+    networks:
+      - confluent
+    depends_on:
+      - spark-master
+
+  # ─────────────────────────────────────────
   # NESSIE - Iceberg REST catalog (metadata)
   # ─────────────────────────────────────────
   nessie:
