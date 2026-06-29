@@ -99,6 +99,7 @@ def create_cdc_tables(t_env):
 def main():
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
+    env.enable_checkpointing(30000)  # checkpoint mỗi 30 giây để flush file xuống MinIO
 
     t_env = StreamTableEnvironment.create(env)
 
