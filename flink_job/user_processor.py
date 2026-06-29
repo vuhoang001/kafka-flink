@@ -1,26 +1,101 @@
 """
-Flink Streaming Job: Kafka → Transform → Kafka
+Flink Streaming Job — 2 pipeline chạy song song trong 1 job:
 
-Flow:
-  Kafka topic [users_created]
-      ↓  (Flink reads, parse JSON)
-  Transform: ghép tên, tính tuổi
-      ↓
-  Kafka topic [users_processed]
+Pipeline 1 (API):
+  Kafka [users_created]  →  MinIO s3a://warehouse/api/
 
-Cách chạy (sau khi docker-compose up):
+Pipeline 2 (CDC):
+  Kafka [postgres.public.users]  →  MinIO s3a://warehouse/cdc/
+  (format Debezium JSON: Flink tự hiểu INSERT/UPDATE/DELETE)
+
+Cách chạy:
   docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
 
 Xem kết quả:
-  Vào http://localhost:18081 để xem Flink Web UI
-  Hoặc consume topic users_processed:
-  docker exec broker kafka-console-consumer \
-    --bootstrap-server broker:29092 \
-    --topic users_processed --from-beginning
+  Flink Web UI  : http://localhost:18081
+  MinIO Console : http://localhost:9001  (user: minio / pass: minio123)
 """
 
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.table import StreamTableEnvironment
+
+
+def create_api_tables(t_env):
+    # SOURCE: Kafka topic users_created, format JSON thuần
+    t_env.execute_sql("""
+        CREATE TABLE IF NOT EXISTS api_source (
+            first_name  STRING,
+            last_name   STRING,
+            gender      STRING,
+            postcode    STRING,
+            email       STRING,
+            username    STRING,
+            dob         STRING,
+            phone       STRING,
+            picture     STRING
+        ) WITH (
+            'connector'                    = 'kafka',
+            'topic'                        = 'users_created',
+            'properties.bootstrap.servers' = 'broker:29092',
+            'properties.group.id'          = 'flink-api-group',
+            'scan.startup.mode'            = 'earliest-offset',
+            'format'                       = 'json'
+        )
+    """)
+
+    # SINK: ghi file JSON vào MinIO, cuộn file sau mỗi 5 phút
+    t_env.execute_sql("""
+        CREATE TABLE IF NOT EXISTS api_sink (
+            full_name  STRING,
+            gender     STRING,
+            email      STRING,
+            username   STRING,
+            birth_year STRING
+        ) WITH (
+            'connector'                              = 'filesystem',
+            'path'                                   = 's3a://warehouse/api/',
+            'format'                                 = 'json',
+            'sink.rolling-policy.rollover-interval'  = '5 min',
+            'sink.rolling-policy.check-interval'     = '1 min'
+        )
+    """)
+
+
+def create_cdc_tables(t_env):
+    # SOURCE: Kafka topic từ Debezium, format debezium-json
+    # Flink tự parse op=c(insert)/u(update)/d(delete) → upsert stream
+    t_env.execute_sql("""
+        CREATE TABLE IF NOT EXISTS cdc_source (
+            id         INT,
+            name       STRING,
+            email      STRING,
+            department STRING,
+            PRIMARY KEY (id) NOT ENFORCED
+        ) WITH (
+            'connector'                    = 'kafka',
+            'topic'                        = 'postgres.public.users',
+            'properties.bootstrap.servers' = 'broker:29092',
+            'properties.group.id'          = 'flink-cdc-group',
+            'scan.startup.mode'            = 'earliest-offset',
+            'format'                       = 'debezium-json'
+        )
+    """)
+
+    # SINK: ghi vào MinIO, mỗi partition có folder riêng theo department
+    t_env.execute_sql("""
+        CREATE TABLE IF NOT EXISTS cdc_sink (
+            id         INT,
+            name       STRING,
+            email      STRING,
+            department STRING
+        ) WITH (
+            'connector'                             = 'filesystem',
+            'path'                                  = 's3a://warehouse/cdc/',
+            'format'                                = 'json',
+            'sink.rolling-policy.rollover-interval' = '5 min',
+            'sink.rolling-policy.check-interval'    = '1 min'
+        )
+    """)
 
 
 def main():
@@ -29,59 +104,30 @@ def main():
 
     t_env = StreamTableEnvironment.create(env)
 
-    # ---------- SOURCE ----------
-    # Đọc dữ liệu từ Kafka topic users_created, parse dưới dạng JSON
-    t_env.execute_sql("""
-        CREATE TABLE users_created (
-            first_name      STRING,
-            last_name       STRING,
-            gender          STRING,
-            postcode        STRING,
-            email           STRING,
-            username        STRING,
-            dob             STRING,
-            registered_date STRING,
-            phone           STRING,
-            picture         STRING
-        ) WITH (
-            'connector'                     = 'kafka',
-            'topic'                         = 'users_created',
-            'properties.bootstrap.servers'  = 'broker:29092',
-            'properties.group.id'           = 'flink-consumer-group',
-            'scan.startup.mode'             = 'earliest-offset',
-            'format'                        = 'json'
-        )
-    """)
+    create_api_tables(t_env)
+    create_cdc_tables(t_env)
 
-    # ---------- SINK ----------
-    # Ghi kết quả đã xử lý vào Kafka topic users_processed
-    t_env.execute_sql("""
-        CREATE TABLE users_processed (
-            full_name   STRING,
-            gender      STRING,
-            email       STRING,
-            username    STRING,
-            birth_year  STRING
-        ) WITH (
-            'connector'                     = 'kafka',
-            'topic'                         = 'users_processed',
-            'properties.bootstrap.servers'  = 'broker:29092',
-            'format'                        = 'json'
-        )
-    """)
+    # StatementSet cho phép chạy nhiều INSERT trong cùng 1 Flink job
+    stmt_set = t_env.create_statement_set()
 
-    # ---------- TRANSFORM ----------
-    # Flink SQL transform: ghép tên và cắt năm sinh từ ISO timestamp
-    t_env.execute_sql("""
-        INSERT INTO users_processed
+    stmt_set.add_insert_sql("""
+        INSERT INTO api_sink
         SELECT
-            CONCAT(first_name, ' ', last_name)  AS full_name,
+            CONCAT(first_name, ' ', last_name) AS full_name,
             gender,
             email,
             username,
-            SUBSTRING(dob, 1, 4)                AS birth_year
-        FROM users_created
+            SUBSTRING(dob, 1, 4)               AS birth_year
+        FROM api_source
     """)
+
+    stmt_set.add_insert_sql("""
+        INSERT INTO cdc_sink
+        SELECT id, name, email, department
+        FROM cdc_source
+    """)
+
+    stmt_set.execute()
 
 
 if __name__ == "__main__":
