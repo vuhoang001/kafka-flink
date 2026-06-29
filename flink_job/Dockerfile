@@ -8,8 +8,7 @@ RUN apt-get update -y && \
 RUN pip3 install apache-flink==1.17.2 --no-cache-dir
 
 # Kafka SQL connector
-RUN wget -q -P /opt/flink/lib/ \
-    "https://repo1.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/1.17.2/flink-sql-connector-kafka-1.17.2.jar"
+COPY flink-sql-connector-kafka-1.17.2.jar /opt/flink/lib/
 
 # S3/MinIO filesystem plugin (JAR đã có sẵn trong image, chỉ cần kích hoạt)
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
