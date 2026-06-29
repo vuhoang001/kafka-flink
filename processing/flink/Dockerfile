@@ -18,9 +18,11 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runt
 RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.5.2/iceberg-aws-bundle-1.5.2.jar \
     -O /opt/flink/lib/iceberg-aws-bundle-1.5.2.jar
 
-# hadoop-common — cần cho Iceberg FlinkCatalogFactory (org.apache.hadoop.conf.Configuration)
+# hadoop-common + hadoop-hdfs-client — Iceberg 1.5.2 FlinkCatalogFactory trực tiếp dùng HdfsConfiguration
 RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar \
-    -O /opt/flink/lib/hadoop-common.jar
+    -O /opt/flink/lib/hadoop-common.jar && \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
+    -O /opt/flink/lib/hadoop-hdfs-client.jar
 
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
