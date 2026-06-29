@@ -1,6 +1,8 @@
+import logging
+import time
 from datetime import datetime
-from airflow import DAG
 
+from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 
 default_args = {
@@ -14,28 +16,51 @@ def get_data():
 
     res = requests.get("https://randomuser.me/api/")
     res = res.json()
-    res = res["results"][0]
-    return res
+    return res["results"][0]
+
 
 def format_data(res):
-    data = {}
-    data["first_name"] = res["name"]["first"]
-    data["last_name"] = res["name"]["last"]
-    data["gender"] = res["gender"]
-    data["postcode"] = res["location"]["postcode"]
-    data["email"] = res["email"]
-    data["username"] = res["login"]["username"]
-    data["dob"] = res["dob"]["date"]
-    data["registered_date"] = res["registered"]["date"]
-    data["phone"] = res["phone"]
-    data['picture'] = res['picture']['medium']
-    return data
+    return {
+        "first_name": res["name"]["first"],
+        "last_name": res["name"]["last"],
+        "gender": res["gender"],
+        "postcode": str(res["location"]["postcode"]),
+        "email": res["email"],
+        "username": res["login"]["username"],
+        "dob": res["dob"]["date"],
+        "registered_date": res["registered"]["date"],
+        "phone": res["phone"],
+        "picture": res["picture"]["medium"],
+    }
 
-def streaming_data():
+
+def stream_to_kafka():
+    """Fetch user data từ API và gửi liên tục vào Kafka topic 'users_created' trong 60 giây."""
     import json
-    res = get_data()
-    res = format_data(res)
-    print(json.dumps(res, indent=3, ensure_ascii=False))
+
+    from kafka import KafkaProducer
+
+    # Airflow chạy trên host, nên kết nối Kafka qua localhost:9092
+    producer = KafkaProducer(
+        bootstrap_servers=["localhost:9092"],
+        max_block_ms=5000,
+    )
+
+    end_time = time.time() + 60  # stream trong 60 giây
+
+    while time.time() < end_time:
+        try:
+            raw = get_data()
+            user = format_data(raw)
+            producer.send("users_created", json.dumps(user).encode("utf-8"))
+            logging.info("Sent: %s %s", user["first_name"], user["last_name"])
+            time.sleep(1)
+        except Exception as e:
+            logging.error("Error: %s", e)
+            continue
+
+    producer.flush()
+    logging.info("Done streaming.")
 
 
 with DAG(
@@ -47,9 +72,10 @@ with DAG(
 ) as dag:
 
     streaming_task = PythonOperator(
-        task_id="streaming_data_from_api", python_callable=streaming_data
+        task_id="stream_users_to_kafka",
+        python_callable=stream_to_kafka,
     )
 
 
 if __name__ == "__main__":
-    streaming_data()
+    stream_to_kafka()
