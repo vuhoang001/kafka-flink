@@ -62,22 +62,20 @@ def create_api_tables(t_env):
 
 
 def create_cdc_tables(t_env):
-    # SOURCE: Kafka topic từ Debezium, format debezium-json
-    # Flink tự parse op=c(insert)/u(update)/d(delete) → upsert stream
+    # SOURCE: đọc raw Debezium JSON, chỉ lấy field after + op
+    # filesystem sink chỉ hỗ trợ append-only nên không dùng debezium-json changelog
     t_env.execute_sql("""
         CREATE TABLE IF NOT EXISTS cdc_source (
-            id         INT,
-            name       STRING,
-            email      STRING,
-            department STRING,
-            PRIMARY KEY (id) NOT ENFORCED
+            after ROW<id INT, name STRING, email STRING, department STRING>,
+            op    STRING
         ) WITH (
             'connector'                    = 'kafka',
             'topic'                        = 'postgres.public.users',
             'properties.bootstrap.servers' = 'broker:29092',
             'properties.group.id'          = 'flink-cdc-group',
             'scan.startup.mode'            = 'earliest-offset',
-            'format'                       = 'debezium-json'
+            'format'                       = 'json',
+            'json.ignore-parse-errors'     = 'true'
         )
     """)
 
@@ -123,8 +121,13 @@ def main():
 
     stmt_set.add_insert_sql("""
         INSERT INTO cdc_sink
-        SELECT id, name, email, department
+        SELECT
+            after.id,
+            after.name,
+            after.email,
+            after.department
         FROM cdc_source
+        WHERE op = 'c' OR op = 'r'
     """)
 
     stmt_set.execute()
