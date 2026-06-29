@@ -2,177 +2,141 @@
 
 ## Vai trò
 
-Trino là **distributed SQL query engine** — đọc Iceberg tables từ MinIO qua Nessie catalog và cho phép query bằng ANSI SQL chuẩn. Không lưu data, chỉ đọc.
-
----
+Trino là **distributed SQL query engine** — đọc Iceberg tables từ MinIO qua Nessie catalog bằng ANSI SQL. Không lưu data, chỉ đọc.
 
 ## Kết nối
 
 ```bash
-# CLI trong Docker
+# CLI interactive
 docker exec -it trino trino
 
-# Chỉ định catalog và schema
-docker exec -it trino trino --catalog iceberg --schema bronze
+# Chạy query 1 lần
+docker exec -it trino trino --execute "SELECT COUNT(*) FROM iceberg.bronze.api_users_raw"
+
+# Kết nối từ ngoài (JDBC)
+# URL: jdbc:trino://localhost:8080/iceberg
+# User: trino (không cần password)
 ```
 
----
+Web UI: http://localhost:8080 — xem query history, execution plan, worker status.
 
-## Catalog và Schema
+## Catalog config
 
-Trino dùng hệ thống 3 cấp: `catalog.schema.table`
+File: `query/trino/etc/catalog/iceberg.properties`
 
-| Catalog | Schema  | Tables |
-|---------|---------|--------|
-| `iceberg` | `bronze` | `api_users_raw`, `cdc_users_raw` |
-| `iceberg` | `silver` | `api_users`, `cdc_users` |
-| `iceberg` | `gold`   | `users_enriched`, `user_stats` |
-
-```sql
--- Xem tất cả schemas
-SHOW SCHEMAS IN iceberg;
-
--- Xem tất cả tables trong bronze
-SHOW TABLES IN iceberg.bronze;
-
--- Xem schema của bảng
-DESCRIBE iceberg.bronze.api_users_raw;
-SHOW COLUMNS FROM iceberg.gold.users_enriched;
+```properties
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://nessie:19120/iceberg
+iceberg.rest-catalog.warehouse=s3a://warehouse/
+fs.native-s3.enabled=true
+s3.endpoint=http://minio:9000
+s3.aws-access-key=minio
+s3.aws-secret-key=minio123
+s3.path-style-access=true
 ```
 
----
+## Queries theo layer
 
-## Query mẫu theo từng nhu cầu
-
-### Operational data (Bronze — gần real-time)
+### Bronze — operational data (30s latency)
 
 ```sql
--- Data mới nhất
-SELECT * FROM iceberg.bronze.api_users_raw
-ORDER BY ingested_at DESC LIMIT 20;
-
--- Monitoring: records per minute
-SELECT DATE_TRUNC('minute', ingested_at) AS minute,
-       COUNT(*) AS cnt
+-- API users theo thời gian thực
+SELECT username, email, gender, ingested_at
 FROM iceberg.bronze.api_users_raw
-WHERE ingested_at > (CURRENT_TIMESTAMP - INTERVAL '1' HOUR)
-GROUP BY 1 ORDER BY 1;
+ORDER BY ingested_at DESC
+LIMIT 20;
 
--- Phát hiện data quality issues trong Bronze
+-- CDC events gần nhất
+SELECT id, name, op, ingested_at
+FROM iceberg.bronze.cdc_users_raw
+ORDER BY ingested_at DESC
+LIMIT 20;
+
+-- Tần suất events theo phút
 SELECT
-    COUNT(*) AS total,
-    COUNT(email) AS has_email,
-    COUNT(CASE WHEN email LIKE '%@%' THEN 1 END) AS valid_email
-FROM iceberg.bronze.api_users_raw;
+    DATE_TRUNC('minute', ingested_at) AS minute,
+    COUNT(*) AS event_count
+FROM iceberg.bronze.cdc_users_raw
+GROUP BY 1
+ORDER BY 1 DESC;
 ```
 
-### Clean data (Silver)
+### Silver — clean data
 
 ```sql
--- Users đã clean
-SELECT * FROM iceberg.silver.api_users LIMIT 10;
+-- Users đã normalize
+SELECT username, full_name, email, gender, birth_year
+FROM iceberg.silver.api_users
+ORDER BY username;
 
--- Xem CDC history của 1 user
-SELECT op, name, department, source_ts, ingested_at
+-- CDC users (không có DELETE)
+SELECT id, name, email, department
 FROM iceberg.silver.cdc_users
-WHERE id = 1;
+ORDER BY id;
 ```
 
-### Business results (Gold)
+### Gold — business data
 
 ```sql
--- Full profile
-SELECT * FROM iceberg.gold.users_enriched LIMIT 10;
+-- Enriched users
+SELECT username, full_name, email, department, birth_year
+FROM iceberg.gold.users_enriched
+WHERE department IS NOT NULL
+ORDER BY username;
 
--- Users chưa match với DB
-SELECT username, email FROM iceberg.gold.users_enriched
-WHERE db_id IS NULL;
-
--- Dashboard metrics
-SELECT gender, department,
-       SUM(total_users) AS total,
-       SUM(matched_db_users) AS in_db
+-- Stats theo department
+SELECT department, SUM(total_users) as total
 FROM iceberg.gold.user_stats
-GROUP BY gender, department
+GROUP BY department
 ORDER BY total DESC;
-```
 
-### Cross-layer queries (so sánh Bronze vs Silver)
-
-```sql
--- Bao nhiêu records Bronze chưa vào Silver (lag)
+-- Match rate giữa API và DB
 SELECT
-    (SELECT COUNT(*) FROM iceberg.bronze.api_users_raw) AS bronze_total,
-    (SELECT COUNT(*) FROM iceberg.silver.api_users)     AS silver_total;
-
--- Data trong Bronze nhưng chưa có trong Silver
-SELECT b.username, b.ingested_at
-FROM iceberg.bronze.api_users_raw b
-LEFT JOIN iceberg.silver.api_users s ON b.username = s.username
-WHERE s.username IS NULL
-ORDER BY b.ingested_at DESC LIMIT 10;
+    COUNT(*) as total_api_users,
+    COUNT(db_id) as matched_with_db,
+    ROUND(100.0 * COUNT(db_id) / COUNT(*), 1) AS match_pct
+FROM iceberg.gold.users_enriched;
 ```
 
----
-
-## Tính năng Iceberg qua Trino
-
-### Time Travel
+### Metadata & Time-travel
 
 ```sql
--- Xem data tại snapshot thứ N
-SELECT * FROM iceberg.bronze.api_users_raw FOR VERSION AS OF 3;
+-- Xem danh sách tables
+SHOW TABLES FROM iceberg.bronze;
+SHOW TABLES FROM iceberg.silver;
+SHOW TABLES FROM iceberg.gold;
 
--- Xem data tại thời điểm cụ thể
-SELECT * FROM iceberg.bronze.api_users_raw
-FOR TIMESTAMP AS OF TIMESTAMP '2026-06-29 10:00:00';
+-- Schema của table
+DESCRIBE iceberg.bronze.api_users_raw;
+
+-- Lịch sử snapshots
+SELECT snapshot_id, committed_at, operation, summary
+FROM iceberg.bronze."api_users_raw$snapshots"
+ORDER BY committed_at DESC;
+
+-- Time-travel: query dữ liệu tại thời điểm cụ thể
+SELECT COUNT(*)
+FROM iceberg.bronze.api_users_raw
+FOR TIMESTAMP AS OF TIMESTAMP '2026-06-29 10:00:00 UTC';
+
+-- Time-travel theo snapshot ID
+SELECT COUNT(*)
+FROM iceberg.bronze.api_users_raw
+FOR VERSION AS OF 1234567890;
+
+-- Files trong table
+SELECT file_path, record_count, file_size_in_bytes
+FROM iceberg.bronze."api_users_raw$files"
+ORDER BY file_size_in_bytes DESC;
+
+-- Partitions
+SELECT partition, record_count
+FROM iceberg.bronze."api_users_raw$partitions";
 ```
 
-### Metadata tables
+## Lưu ý
 
-```sql
--- Xem tất cả snapshots của bảng
-SELECT * FROM iceberg.bronze."api_users_raw$snapshots";
-
--- Xem danh sách files Parquet
-SELECT * FROM iceberg.bronze."api_users_raw$files";
-
--- Xem lịch sử thay đổi manifest
-SELECT * FROM iceberg.bronze."api_users_raw$manifests";
-```
-
----
-
-## Web UI
-
-URL: http://localhost:8080
-
-Từ UI có thể thấy:
-- Query đang chạy và đã hoàn thành
-- Query plan (execution graph)
-- Resource usage (CPU, memory, I/O)
-- Worker nodes
-
----
-
-## Cấu hình (`query/trino/etc/`)
-
-| File | Mô tả |
-|------|-------|
-| `config.properties` | Coordinator settings, port, memory limits |
-| `node.properties` | Node ID và data directory |
-| `jvm.config` | JVM heap size (2GB mặc định) |
-| `catalog/iceberg.properties` | Kết nối Nessie + MinIO |
-
-### Tăng memory cho query lớn
-
-Sửa `jvm.config`:
-```
--Xmx4G   # tăng từ 2G lên 4G
-```
-
-Sửa `config.properties`:
-```
-query.max-memory=4GB
-query.max-memory-per-node=2GB
-```
+- Trino đọc Iceberg **read-only** — không hỗ trợ MERGE INTO hay DELETE trên Iceberg (dùng Spark cho transform)
+- Query Bronze sẽ chỉ thấy data đã được Flink commit (sau checkpoint)
+- Time-travel chỉ hoạt động trên dữ liệu còn trong MinIO (chưa bị expire/delete)

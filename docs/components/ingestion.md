@@ -2,185 +2,158 @@
 
 ## Tổng quan
 
-Có 3 cách đưa data vào pipeline:
+Có 2 cách đưa data vào pipeline:
 
-| Cách | File | Trigger | Topic Kafka |
-|------|------|---------|-------------|
-| HTTP API | `ingestion/api/` | Người dùng gọi POST | `users_created` |
-| Airflow DAG | `ingestion/dags/kafka_stream.py` | Scheduled (hàng ngày) | `users_created` |
-| PostgreSQL CDC | `cdc/postgres-connector.json` | Mọi INSERT/UPDATE/DELETE | `postgres.public.users` |
+1. **FastAPI** — HTTP API cho external applications đẩy user data
+2. **PostgreSQL CDC** — Debezium tự động capture thay đổi từ DB
 
----
-
-## FastAPI (`ingestion/api/`)
-
-### Mô tả
-
-FastAPI service nhận HTTP request, validate bằng Pydantic, produce vào Kafka `users_created`.
+## FastAPI
 
 ### Endpoints
 
 | Method | Path | Mô tả |
 |--------|------|-------|
-| `POST` | `/users` | Nhận user data, ghi vào Kafka |
-| `GET`  | `/health` | Health check |
-| `GET`  | `/docs` | Swagger UI tự động |
+| POST | `/users` | Gửi 1 user vào Kafka topic `users_created` |
+| GET | `/health` | Health check |
+| GET | `/docs` | Swagger UI tự động |
 
-### Schema request (`POST /users`)
+### Request schema (POST /users)
 
 ```json
 {
-  "first_name": "Nguyen",
-  "last_name":  "Van A",
+  "first_name": "Hoang",
+  "last_name":  "Nguyen",
   "gender":     "male",
   "postcode":   "100000",
-  "email":      "a@example.com",
-  "username":   "nguyenvana",
-  "dob":        "1995-01-01T00:00:00Z",
+  "email":      "hoang@example.com",
+  "username":   "hoangnv",
+  "dob":        "1995-01-15",
   "phone":      "0901234567",
   "picture":    ""
 }
 ```
 
-Tất cả fields là bắt buộc trừ `picture`.
+| Field | Type | Required | Validation |
+|-------|------|----------|------------|
+| first_name | string | ✓ | |
+| last_name | string | ✓ | |
+| gender | string | ✓ | |
+| postcode | string | ✓ | |
+| email | string | ✓ | EmailStr (Pydantic validate format) |
+| username | string | ✓ | |
+| dob | string | ✓ | Chuỗi tự do, ví dụ "1995-01-15" |
+| phone | string | ✓ | |
+| picture | string | — | Mặc định rỗng `""` |
 
-### Cách gọi
+### Response
+
+```json
+{"status": "ok", "message": "User hoangnv sent to Kafka"}
+```
+
+Lỗi Kafka:
+```json
+{"detail": "Kafka error: ..."}
+```
+HTTP 502.
+
+### Ví dụ gọi API
 
 ```bash
-# POST một user
+# 1 user
 curl -X POST http://localhost:8000/users \
   -H "Content-Type: application/json" \
   -d '{
-    "first_name": "Nguyen", "last_name": "Van A",
-    "gender": "male", "postcode": "100000",
-    "email": "a@example.com", "username": "nguyenvana",
-    "dob": "1995-01-01T00:00:00Z", "phone": "0901234567"
+    "first_name": "Hoang",
+    "last_name":  "Nguyen",
+    "gender":     "male",
+    "postcode":   "100000",
+    "email":      "hoang@example.com",
+    "username":   "hoangnv",
+    "dob":        "1995-01-15",
+    "phone":      "0901234567"
   }'
 
-# Health check
-curl http://localhost:8000/health
+# Batch (loop trong bash)
+for i in $(seq 1 10); do
+  curl -s -X POST http://localhost:8000/users \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"first_name\": \"Test\",
+      \"last_name\":  \"User$i\",
+      \"gender\":     \"male\",
+      \"postcode\":   \"10000$i\",
+      \"email\":      \"test$i@example.com\",
+      \"username\":   \"testuser$i\",
+      \"dob\":        \"199$i-06-15\",
+      \"phone\":      \"090000000$i\"
+    }" && echo ""
+done
 
 # Swagger UI
 open http://localhost:8000/docs
 ```
 
-### Cấu trúc file
+## PostgreSQL CDC
 
-```
-ingestion/api/
-├── main.py          # FastAPI app + Kafka producer
-├── requirements.txt # fastapi, uvicorn, kafka-python, pydantic[email]
-└── Dockerfile       # python:3.11-slim, port 8000
-```
+Dữ liệu thay đổi trong bảng `public.users` của PostgreSQL sẽ tự động được Debezium capture và gửi vào Kafka.
 
----
-
-## Airflow DAG — kafka_stream.py
-
-### Mô tả
-
-Pull data từ `randomuser.me` API và produce vào Kafka. Chạy 60 giây mỗi lần kích hoạt (1 message/giây = 60 users/lần).
-
-### Lịch chạy
-
-```python
-schedule="@daily"   # Chạy 1 lần/ngày lúc 00:00
-```
-
-### Chạy thủ công
+### Thay đổi trong PostgreSQL
 
 ```bash
-# Chạy trực tiếp (không cần Airflow)
-python ingestion/dags/kafka_stream.py
+# INSERT (op=c trong Kafka)
+docker exec postgres psql -U postgres -d mydb -c "
+  INSERT INTO users (name, email, department)
+  VALUES ('New User', 'newuser@example.com', 'Engineering');
+"
+
+# UPDATE (op=u trong Kafka)
+docker exec postgres psql -U postgres -d mydb -c "
+  UPDATE users SET department = 'Platform' WHERE email = 'newuser@example.com';
+"
+
+# DELETE (op=d trong Kafka — Silver sẽ bỏ qua)
+docker exec postgres psql -U postgres -d mydb -c "
+  DELETE FROM users WHERE email = 'newuser@example.com';
+"
+
+# Xem dữ liệu hiện tại
+docker exec postgres psql -U postgres -d mydb -c "SELECT * FROM users;"
 ```
 
-### Cấu trúc flow
-
-```
-get_data()          # GET https://randomuser.me/api/
-    │
-format_data()       # Extract fields cần thiết
-    │
-stream_to_kafka()   # Produce vào topic users_created (60 giây)
-```
-
----
-
-## Airflow DAG — dbt_pipeline.py
-
-### Mô tả
-
-Chạy dbt transformation pipeline: Bronze → Silver → Gold.
-
-### Lịch chạy
-
-```python
-schedule="*/15 * * * *"   # Mỗi 15 phút
-```
-
-### Dependency
-
-```
-dbt_run_silver >> dbt_run_gold
-```
-
-Silver phải hoàn thành trước khi Gold bắt đầu, vì Gold phụ thuộc Silver.
-
-### Config
-
-Biến môi trường `DBT_PROJECT_DIR` xác định đường dẫn tới dbt project. Mặc định: đường dẫn tương đối từ dags folder.
-
----
-
-## PostgreSQL CDC (`cdc/`)
-
-### Mô tả
-
-Debezium connector theo dõi bảng `public.users` trong PostgreSQL và publish mọi thay đổi vào Kafka.
-
-### Điều kiện PostgreSQL cần có
+### Schema bảng `users`
 
 ```sql
--- PostgreSQL phải có wal_level=logical (đã cấu hình trong docker-compose)
-SHOW wal_level;  -- phải là 'logical'
+CREATE TABLE users (
+    id         SERIAL PRIMARY KEY,
+    name       VARCHAR(100) NOT NULL,
+    email      VARCHAR(100) NOT NULL,
+    department VARCHAR(50)
+);
 ```
 
-### Connector config (`cdc/postgres-connector.json`)
+## Airflow DAG
 
-```json
-{
-  "name": "postgres-connector",
-  "config": {
-    "connector.class":   "io.debezium.connector.postgresql.PostgresConnector",
-    "database.hostname": "postgres",
-    "database.port":     "5432",
-    "database.user":     "postgres",
-    "database.password": "postgres",
-    "database.dbname":   "mydb",
-    "table.include.list": "public.users",
-    "plugin.name":       "pgoutput",
-    "topic.prefix":      "postgres",
-    "slot.name":         "debezium"
-  }
-}
+File: `ingestion/dags/spark_pipeline.py`
+
+DAG `spark_medallion_pipeline` chạy Spark Silver → Gold mỗi 15 phút:
+
+```
+silver_transform.py  →  gold_transform.py
 ```
 
-Connector được tự động đăng ký bởi `connector-init` service khi khởi động.
-
-### Quản lý connector
+Nếu chưa cài Airflow, chạy thủ công:
 
 ```bash
-# Xem status
-curl http://localhost:8083/connectors/postgres-connector/status
+# Silver
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --py-files /opt/spark/jobs/spark_session.py \
+  /opt/spark/jobs/silver_transform.py
 
-# Restart connector nếu lỗi
-curl -X POST http://localhost:8083/connectors/postgres-connector/restart
-
-# Xóa connector (dừng CDC)
-curl -X DELETE http://localhost:8083/connectors/postgres-connector
-
-# Đăng ký lại
-curl -X POST http://localhost:8083/connectors \
-  -H "Content-Type: application/json" \
-  -d @cdc/postgres-connector.json
+# Gold (sau khi Silver xong)
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --py-files /opt/spark/jobs/spark_session.py \
+  /opt/spark/jobs/gold_transform.py
 ```
