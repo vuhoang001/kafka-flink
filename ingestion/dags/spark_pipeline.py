@@ -18,7 +18,7 @@ JOBS_DIR     = "/opt/spark/jobs"
 
 SPARK_SUBMIT = (
     "docker exec spark-master "
-    "spark-submit "
+    "/opt/spark/bin/spark-submit "
     f"--master {SPARK_MASTER} "
     "--py-files {jobs_dir}/spark_session.py "
     "{jobs_dir}/{job}"

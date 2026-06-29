@@ -156,8 +156,7 @@ services:
     build: ./processing/spark
     container_name: spark-master
     hostname: spark-master
-    environment:
-      SPARK_MODE: master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
       - "7077:7077"    # Spark master port (spark-submit connect vào đây)
       - "8090:8080"    # Spark Web UI: http://localhost:8090
@@ -175,9 +174,8 @@ services:
     build: ./processing/spark
     container_name: spark-worker
     hostname: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
     volumes:
