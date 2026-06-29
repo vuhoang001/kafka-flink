@@ -18,6 +18,10 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runt
 RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.5.2/iceberg-aws-bundle-1.5.2.jar \
     -O /opt/flink/lib/iceberg-aws-bundle-1.5.2.jar
 
+# Hadoop shaded uber JAR — cần cho Iceberg FlinkCatalogFactory (dùng main classloader, không phải plugin)
+RUN wget -q https://repo1.maven.org/maven2/org/apache/flink/flink-shaded-hadoop-3-uber/3.1.1.7.2.9.0-173-9.0/flink-shaded-hadoop-3-uber-3.1.1.7.2.9.0-173-9.0.jar \
+    -O /opt/flink/lib/flink-shaded-hadoop-3-uber.jar
+
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
     cp /opt/flink/opt/flink-s3-fs-hadoop-*.jar /opt/flink/plugins/s3-fs-hadoop/
