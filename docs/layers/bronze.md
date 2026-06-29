@@ -2,99 +2,96 @@
 
 ## Mục đích
 
-Bronze là lớp **raw data** — lưu nguyên xi dữ liệu từ Kafka vào Iceberg, không transform. Nguyên tắc chính:
+Bronze là lớp **raw data** — lưu nguyên xi dữ liệu từ Kafka vào Iceberg Parquet, không transform. Chỉ thêm `ingested_at` để trace thời điểm nhận được.
 
-- **Append-only**: không bao giờ sửa hay xóa record
-- **Immutable**: giữ nguyên mọi trường từ nguồn
-- **Auditable**: có `ingested_at` để biết data đến lúc nào
-- **Replayable**: nếu Silver/Gold bị hỏng, Bronze là nguồn để rebuild
-
----
+Nguyên tắc:
+- **Append-only**: không UPDATE, không DELETE
+- **Schema fidelity**: giữ đúng cấu trúc gốc từ producer
+- **Replay-safe**: nếu Flink crash, khởi động lại từ checkpoint — Bronze có thể có duplicate, tầng Silver xử lý dedup
 
 ## Tables
 
 ### `iceberg.bronze.api_users_raw`
 
-Chứa raw data từ API (FastAPI POST /users hoặc Airflow DAG pull randomuser.me).
+Dữ liệu từ FastAPI → Kafka topic `users_created` → Flink → Bronze.
 
-| Column       | Type         | Mô tả |
-|--------------|--------------|-------|
-| `first_name` | STRING       | Tên (raw, chưa trim) |
-| `last_name`  | STRING       | Họ (raw) |
-| `gender`     | STRING       | Giới tính (raw: "male", "female") |
-| `postcode`   | STRING       | Mã bưu điện |
-| `email`      | STRING       | Email (raw, chưa lowercase) |
-| `username`   | STRING       | Tên đăng nhập |
-| `dob`        | STRING       | Ngày sinh dạng ISO 8601 string |
-| `phone`      | STRING       | Số điện thoại |
-| `picture`    | STRING       | URL ảnh đại diện |
-| `ingested_at`| TIMESTAMP(3) | Thời điểm Flink ghi vào Bronze |
+| Column | Type | Nguồn | Mô tả |
+|--------|------|-------|-------|
+| first_name | STRING | API request | |
+| last_name | STRING | API request | |
+| gender | STRING | API request | "male" / "female" |
+| postcode | STRING | API request | |
+| email | STRING | API request | |
+| username | STRING | API request | |
+| dob | STRING | API request | Chuỗi ngày, ví dụ "1995-01-15" |
+| phone | STRING | API request | |
+| picture | STRING | API request | URL ảnh, có thể rỗng |
+| ingested_at | TIMESTAMP(3) | Flink `CURRENT_TIMESTAMP` | Thời điểm Flink nhận được |
 
 ### `iceberg.bronze.cdc_users_raw`
 
-Chứa tất cả CDC events từ PostgreSQL qua Debezium — giữ cả `op` để trace lịch sử.
+Dữ liệu từ PostgreSQL → Debezium → Kafka topic `postgres.public.users` → Flink → Bronze.
 
-| Column        | Type         | Mô tả |
-|---------------|--------------|-------|
-| `id`          | INT          | Primary key từ PostgreSQL |
-| `name`        | STRING       | Tên user (raw) |
-| `email`       | STRING       | Email (raw) |
-| `department`  | STRING       | Phòng ban |
-| `op`          | STRING       | Operation: `c`=create, `u`=update, `d`=delete, `r`=read/snapshot |
-| `source_ts_ms`| BIGINT       | Timestamp transaction trong PostgreSQL (milliseconds) |
-| `ingested_at` | TIMESTAMP(3) | Thời điểm Flink ghi vào Bronze |
+| Column | Type | Nguồn | Mô tả |
+|--------|------|-------|-------|
+| id | INT | `after.id` | Primary key của bảng PostgreSQL |
+| name | STRING | `after.name` | |
+| email | STRING | `after.email` | |
+| department | STRING | `after.department` | |
+| op | STRING | Debezium field | `c`=create, `u`=update, `d`=delete, `r`=read/snapshot |
+| source_ts_ms | BIGINT | Debezium `ts_ms` | Epoch ms khi event xảy ra trong DB |
+| ingested_at | TIMESTAMP(3) | Flink `CURRENT_TIMESTAMP` | Thời điểm Flink nhận được |
 
----
+## Storage
 
-## Cách Bronze được ghi
+- **Format**: Apache Iceberg (format-version 2) + Parquet
+- **Location**: `s3://warehouse/bronze/` (MinIO)
+- **Commit cycle**: sau mỗi Flink checkpoint (30 giây)
+- **Visibility**: data visible sau khi Flink commit Parquet file hoàn chỉnh
 
-Flink job (`processing/flink/user_processor.py`) chạy 2 pipeline:
+## Query Bronze (Trino)
 
+```bash
+docker exec -it trino trino
 ```
-Kafka [users_created]          → iceberg.bronze.api_users_raw
-Kafka [postgres.public.users]  → iceberg.bronze.cdc_users_raw
-```
-
-Data được flush xuống MinIO mỗi **30 giây** (Flink checkpoint interval).
-
----
-
-## Query operational data từ Bronze
 
 ```sql
--- Tất cả records mới nhất (real-time nhất có thể)
-SELECT * FROM iceberg.bronze.api_users_raw
+-- API users mới nhất
+SELECT username, email, gender, ingested_at
+FROM iceberg.bronze.api_users_raw
 ORDER BY ingested_at DESC
 LIMIT 20;
 
--- Theo dõi ingestion rate
-SELECT
-    DATE_TRUNC('minute', ingested_at) AS minute,
-    COUNT(*) AS records
-FROM iceberg.bronze.api_users_raw
-WHERE ingested_at > (CURRENT_TIMESTAMP - INTERVAL '1' HOUR)
-GROUP BY 1
-ORDER BY 1;
-
--- Xem lịch sử thay đổi của 1 user cụ thể (CDC)
-SELECT op, name, department, source_ts_ms, ingested_at
+-- CDC events theo thứ tự
+SELECT id, name, op, department, ingested_at
 FROM iceberg.bronze.cdc_users_raw
-WHERE id = 1
-ORDER BY source_ts_ms;
+ORDER BY ingested_at DESC
+LIMIT 20;
 
--- Time travel: xem data tại snapshot thứ 2
-SELECT * FROM iceberg.bronze.api_users_raw
-FOR VERSION AS OF 2;
+-- Đếm records
+SELECT COUNT(*) FROM iceberg.bronze.api_users_raw;
+SELECT COUNT(*) FROM iceberg.bronze.cdc_users_raw;
 
--- Xem tất cả snapshots hiện có
-SELECT * FROM iceberg.bronze."api_users_raw$snapshots";
+-- Phân phối theo op (CDC)
+SELECT op, COUNT(*) as cnt
+FROM iceberg.bronze.cdc_users_raw
+GROUP BY op;
+-- r: initial snapshot, c: insert, u: update, d: delete
+
+-- Xem metadata Iceberg
+SELECT snapshot_id, committed_at, operation
+FROM iceberg.bronze."api_users_raw$snapshots"
+ORDER BY committed_at DESC;
 ```
 
----
+## Latency
 
-## Lưu ý
+Thời gian từ lúc POST API đến lúc Bronze có thể query được:
 
-- Bronze **không filter op** — cả INSERT lẫn DELETE đều được lưu vào `cdc_users_raw`
-- Raw data có thể có duplicate (Kafka retry, at-least-once delivery) → Silver mới deduplicate
-- File format: **Parquet** (nén tốt, columnar, Trino đọc nhanh)
-- Iceberg format-version 2 → hỗ trợ row-level delete (dùng cho Silver upsert)
+```
+POST request → Kafka (< 100ms) → Flink nhận (< 1s) → checkpoint (0-30s) → commit → visible
+```
+
+Tổng: **10–60 giây** (trung bình ~30s tùy thời điểm checkpoint).
+
+Đây là đặc tính của Iceberg file-based format, không phải hạn chế của Flink hay Kafka.

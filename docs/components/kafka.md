@@ -4,77 +4,87 @@
 
 ### Cấu hình
 
-Kafka chạy ở chế độ **KRaft** (không cần ZooKeeper). Cluster ID tĩnh trong `docker-compose.yaml`.
+- **Mode**: KRaft (không cần ZooKeeper)
+- **Image**: `confluentinc/cp-kafka:7.4.0`
+- **Cluster ID**: `MkU3OEVBNTcwNTJENDM2Qk`
+- **Replication factor**: 1 (single broker, dev only)
 
-| Topic | Producer | Consumer | Mô tả |
-|-------|----------|----------|-------|
-| `users_created` | FastAPI, Airflow | Flink | Data user từ API |
+### Topics
+
+| Topic | Producer | Consumer | Nội dung |
+|-------|----------|----------|---------|
+| `users_created` | FastAPI | Flink | JSON user từ HTTP API |
 | `postgres.public.users` | Debezium | Flink | CDC events từ PostgreSQL |
-| `debezium_connect_configs` | Debezium | Debezium | Internal |
-| `debezium_connect_offsets` | Debezium | Debezium | Internal |
-| `debezium_connect_statuses` | Debezium | Debezium | Internal |
 
-### Kiểm tra topics
+### Lệnh quản lý
 
 ```bash
-# Liệt kê tất cả topics
+# List topics
 docker exec broker kafka-topics \
-  --bootstrap-server broker:29092 --list
+  --bootstrap-server localhost:9092 --list
 
-# Xem messages trong topic (từ đầu, lấy 5 messages)
+# Xem messages trong topic
 docker exec broker kafka-console-consumer \
-  --bootstrap-server broker:29092 \
+  --bootstrap-server localhost:9092 \
   --topic users_created \
   --from-beginning \
   --max-messages 5
 
 # Xem CDC messages
 docker exec broker kafka-console-consumer \
-  --bootstrap-server broker:29092 \
+  --bootstrap-server localhost:9092 \
   --topic postgres.public.users \
   --from-beginning \
   --max-messages 5
 
-# Xem số messages trong topic
-docker exec broker kafka-run-class kafka.tools.GetOffsetShell \
-  --bootstrap-server broker:29092 \
-  --topic users_created
+# Consumer group lag (Flink lag)
+docker exec broker kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --describe --group flink-api-group
+
+docker exec broker kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --describe --group flink-cdc-group
 ```
 
-### Listeners
+## Debezium (Kafka Connect)
 
-| Listener | Địa chỉ | Dùng bởi |
-|----------|---------|---------|
-| `PLAINTEXT` | `broker:29092` | Các container trong Docker network |
-| `PLAINTEXT_HOST` | `localhost:9092` | Kết nối từ host machine |
+### Vai trò
 
----
+Debezium đọc PostgreSQL **Write-Ahead Log (WAL)** để capture INSERT, UPDATE, DELETE mà không cần thay đổi application code.
 
-## Debezium (CDC)
+Yêu cầu PostgreSQL:
+- `wal_level = logical` (đã set trong docker-compose: `command: postgres -c wal_level=logical`)
+- `POSTGRES_HOST_AUTH_METHOD: md5` (Debezium cần md5, không phải scram)
 
-### Cách hoạt động
+### Connector config
 
-```
-PostgreSQL WAL (Write-Ahead Log)
-        │
-        │  Debezium đọc WAL liên tục
-        ▼
-kafka-connect (Debezium connector)
-        │
-        │  Publish event mỗi khi có thay đổi
-        ▼
-Kafka topic: postgres.public.users
-```
-
-**WAL** (Write-Ahead Log): PostgreSQL ghi mọi thay đổi vào WAL trước khi apply vào table. Debezium đọc WAL này như đọc một "stream of changes" mà không cần trigger hay stored procedure.
-
-### Format message
-
-Mỗi CDC event có cấu trúc:
+File: `cdc/postgres-connector.json`
 
 ```json
 {
-  "before": null,
+  "name": "postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "postgres",
+    "database.dbname": "mydb",
+    "topic.prefix": "postgres",
+    "table.include.list": "public.users",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_slot",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}
+```
+
+### CDC Message format
+
+```json
+{
   "after": {
     "id": 1,
     "name": "Alice Nguyen",
@@ -82,68 +92,46 @@ Mỗi CDC event có cấu trúc:
     "department": "Engineering"
   },
   "op": "c",
-  "ts_ms": 1735000000000,
-  "source": { "table": "users", "lsn": 12345 }
+  "ts_ms": 1719619200000
 }
 ```
 
-| Field | Giá trị | Mô tả |
-|-------|---------|-------|
-| `op`  | `c` | CREATE (INSERT mới) |
-| `op`  | `u` | UPDATE |
-| `op`  | `d` | DELETE (`after` = null) |
-| `op`  | `r` | READ (snapshot ban đầu khi connector khởi động) |
+| `op` | Ý nghĩa |
+|------|---------|
+| `r` | Read/snapshot — initial load khi connector đăng ký lần đầu |
+| `c` | Create — INSERT |
+| `u` | Update — UPDATE |
+| `d` | Delete — DELETE (field `after` = null) |
 
-### Kiểm tra connector
+### Quản lý connector
 
 ```bash
-# Xem connector đã đăng ký chưa
-curl -s http://localhost:8083/connectors | python3 -m json.tool
-
-# Xem status của connector
+# Xem trạng thái connector
 curl -s http://localhost:8083/connectors/postgres-connector/status \
   | python3 -m json.tool
 
-# Xem config connector
-curl -s http://localhost:8083/connectors/postgres-connector/config \
-  | python3 -m json.tool
+# Xóa và đăng ký lại (nếu connector lỗi)
+curl -X DELETE http://localhost:8083/connectors/postgres-connector
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @cdc/postgres-connector.json
+
+# Xem danh sách connectors
+curl -s http://localhost:8083/connectors | python3 -m json.tool
+
+# Pause / Resume
+curl -X PUT http://localhost:8083/connectors/postgres-connector/pause
+curl -X PUT http://localhost:8083/connectors/postgres-connector/resume
 ```
 
-### Config connector (`cdc/postgres-connector.json`)
+### Lưu ý replication slot
 
-```json
-{
-  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-  "database.hostname": "postgres",
-  "database.port": "5432",
-  "database.user": "postgres",
-  "database.password": "postgres",
-  "database.dbname": "mydb",
-  "table.include.list": "public.users",
-  "plugin.name": "pgoutput",
-  "topic.prefix": "postgres"
-}
-```
-
-**Tại sao `plugin.name = pgoutput`?**  
-`pgoutput` là native PostgreSQL logical decoding plugin, không cần cài thêm gì.
-
-**Tại sao PostgreSQL dùng `md5` auth?**  
-Debezium 2.4 chưa hỗ trợ `scram-sha-256` — phải dùng `md5` để kết nối được.
-
-### Trigger CDC thủ công
+Debezium tạo replication slot `debezium_slot` trong PostgreSQL. Nếu Debezium bị stop mà slot không được xóa, PostgreSQL sẽ giữ WAL và disk có thể đầy theo thời gian.
 
 ```bash
-# Kết nối vào PostgreSQL
-docker exec -it postgres psql -U postgres -d mydb
+# Xem replication slots
+docker exec postgres psql -U postgres -c "SELECT slot_name, active FROM pg_replication_slots;"
 
-# INSERT mới → sẽ sinh ra op='c'
-INSERT INTO users (name, email, department)
-VALUES ('Test User', 'test@example.com', 'QA');
-
-# UPDATE → op='u'
-UPDATE users SET department = 'Engineering' WHERE email = 'test@example.com';
-
-# DELETE → op='d'
-DELETE FROM users WHERE email = 'test@example.com';
+# Nếu cần xóa slot thủ công (khi Debezium đã được xóa)
+docker exec postgres psql -U postgres -c "SELECT pg_drop_replication_slot('debezium_slot');"
 ```

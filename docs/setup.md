@@ -1,185 +1,186 @@
-# Hướng dẫn cài đặt và khởi động
+# Hướng dẫn Setup & Khởi động
 
 ## Yêu cầu
 
-| Công cụ | Phiên bản tối thiểu |
-|---------|---------------------|
-| Docker  | 24+                 |
-| Docker Compose | 2.20+        |
-| Python  | 3.9+ (cho dbt local) |
+| Công cụ | Phiên bản tối thiểu | Ghi chú |
+|---------|---------------------|---------|
+| Docker | 24+ | |
+| Docker Compose | v2.20+ | dùng `docker compose` (không phải `docker-compose`) |
+| RAM | 8 GB | Khuyến nghị 12 GB cho Flink + Spark + Trino cùng lúc |
+| Disk | 20 GB | MinIO data + Docker images |
 
-Phần cứng khuyến nghị: **8 GB RAM**, 4 CPU cores (Flink + Trino ngốn RAM).
+## Bước 1 — Clone dự án
 
----
+```bash
+git clone https://gitlab.foxai.com.vn/hoangtv/ingest-data.git
+cd ingest-data
+```
 
-## Bước 1 — Khởi động toàn bộ stack
+## Bước 2 — Build images
+
+Build Flink và Spark images (tải JARs về, mất 2-5 phút lần đầu):
+
+```bash
+docker compose build
+```
+
+Nếu muốn build riêng từng service:
+
+```bash
+docker compose build flink-jobmanager   # cũng build flink-taskmanager
+docker compose build spark-master       # cũng build spark-worker
+docker compose build api
+```
+
+## Bước 3 — Khởi động infrastructure
 
 ```bash
 docker compose up -d
 ```
 
-Thứ tự khởi động tự động (theo `depends_on`):
-
-```
-postgres → broker → kafka-connect → connector-init
-        └→ nessie
-minio   → minio-init
-        → flink-jobmanager → flink-taskmanager
-        → nessie → trino
-broker  → api
-```
-
-Kiểm tra tất cả service đang chạy:
+Chờ tất cả services healthy (~60 giây):
 
 ```bash
 docker compose ps
 ```
 
-Đợi tất cả ở trạng thái `healthy` (khoảng 60–120 giây).
+Kết quả mong đợi — tất cả STATUS phải là `healthy` hoặc `Up`:
 
----
-
-## Bước 2 — Verify từng service
-
-```bash
-# Kafka đang nhận kết nối
-docker exec broker kafka-topics \
-  --bootstrap-server broker:29092 --list
-
-# Debezium connector đã đăng ký
-curl -s http://localhost:8083/connectors | python3 -m json.tool
-
-# Nessie REST catalog phản hồi
-curl http://localhost:19120/iceberg/v1/config
-
-# MinIO bucket warehouse tồn tại
-docker run --rm --network realtime-data-streaming_confluent \
-  minio/mc:latest sh -c \
-  "mc alias set local http://minio:9000 minio minio123 && mc ls local/"
-
-# Trino đang chạy
-curl -s http://localhost:8080/v1/info | python3 -m json.tool
+```
+NAME              STATUS
+broker            healthy
+postgres          healthy
+kafka-connect     healthy
+connector-init    exited (0)    ← OK, chạy xong rồi thoát
+minio             healthy
+minio-init        exited (0)    ← OK
+nessie            healthy
+spark-master      Up
+spark-worker      Up
+trino             healthy
+api               healthy
+flink-jobmanager  Up
+flink-taskmanager Up
 ```
 
----
+## Bước 4 — Tạo nessiedb (lần đầu setup)
 
-## Bước 3 — Submit Flink job
+> **Chỉ cần chạy 1 lần** nếu PostgreSQL volume đã tồn tại từ trước (volume cũ không chạy lại init.sql).
 
 ```bash
-docker exec flink-jobmanager \
-  flink run -d -py /opt/flink/jobs/user_processor.py
+docker exec postgres psql -U postgres -c "CREATE DATABASE nessiedb;"
 ```
 
-Kiểm tra job đã chạy:
+Nếu trả về `ERROR: database "nessiedb" already exists` → bỏ qua, đã có rồi.
+
+Sau đó restart Nessie:
 
 ```bash
-docker exec flink-jobmanager flink list
+docker compose restart nessie
 ```
 
-Xem log nếu có lỗi:
+Kiểm tra Nessie healthy:
 
 ```bash
-docker logs flink-taskmanager 2>&1 | tail -50
+docker logs nessie --tail 20
+# Phải thấy: Nessie API REST service running on ...
+curl -s http://localhost:19120/q/health | python3 -m json.tool
+# "status": "UP"
 ```
 
----
-
-## Bước 4 — Đẩy data vào
-
-### Qua FastAPI
+## Bước 5 — Submit Flink job
 
 ```bash
-curl -X POST http://localhost:8000/users \
-  -H "Content-Type: application/json" \
-  -d '{
-    "first_name": "Nguyen",
-    "last_name":  "Van A",
-    "gender":     "male",
-    "postcode":   "100000",
-    "email":      "a@example.com",
-    "username":   "nguyenvana",
-    "dob":        "1995-01-01T00:00:00Z",
-    "phone":      "0901234567",
-    "picture":    ""
-  }'
-```
-
-Swagger UI đầy đủ: http://localhost:8000/docs
-
-### Qua Airflow DAG (pull tự động)
-
-```bash
-# Chạy manual một lần
-python ingestion/dags/kafka_stream.py
-```
-
-DAG `user_automation` chạy `@daily` nếu Airflow đang chạy.
-
----
-
-## Bước 5 — Chờ Bronze layer có data
-
-Sau khoảng 30 giây (một checkpoint cycle), kiểm tra:
-
-```bash
-docker exec -it trino trino \
-  --execute "SELECT COUNT(*) FROM iceberg.bronze.api_users_raw"
-```
-
----
-
-## Bước 6 — Cài dbt và chạy transformation
-
-```bash
-pip install dbt-trino
-
-cd query/dbt
-
-# Kiểm tra kết nối Trino
-dbt debug --profiles-dir .
-
-# Chạy toàn bộ pipeline Bronze → Silver → Gold
-dbt run --profiles-dir .
-```
-
-Sau khi `dbt run` xong:
-
-```bash
-docker exec -it trino trino \
-  --execute "SELECT * FROM iceberg.gold.users_enriched LIMIT 5"
-```
-
----
-
-## Rebuild sau khi thay đổi code
-
-### Chỉ rebuild Flink (thay đổi user_processor.py hoặc Dockerfile)
-
-```bash
-docker compose up -d --build flink-jobmanager flink-taskmanager
-
-# Submit lại job mới
-docker exec flink-jobmanager flink list  # ghi lại job ID
-docker exec flink-jobmanager flink cancel <job-id>
 docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
 ```
 
-### Rebuild toàn bộ (xóa data cũ)
+Kiểm tra job đang chạy:
 
 ```bash
-docker compose down -v   # xóa cả volumes (mất data!)
-docker compose up -d --build
+# Qua CLI
+docker exec flink-jobmanager flink list
+
+# Qua Web UI
+open http://localhost:18081
+# Phải thấy 1 job RUNNING với 2 tasks
 ```
 
----
+## Bước 6 — Verify các services
 
-## Xem UI
+### Kafka
+```bash
+# List topics
+docker exec broker kafka-topics --bootstrap-server localhost:9092 --list
+# Phải thấy: users_created, postgres.public.users
 
-| Service       | URL                        | Login              |
-|---------------|----------------------------|--------------------|
-| API Swagger   | http://localhost:8000/docs | —                  |
-| Flink Web UI  | http://localhost:18081     | —                  |
-| MinIO Console | http://localhost:9001      | minio / minio123   |
-| Nessie        | http://localhost:19120     | —                  |
-| Trino Web UI  | http://localhost:8080      | user: `trino`      |
-| Kafka Connect | http://localhost:8083      | —                  |
+# Debezium connector
+curl -s http://localhost:8083/connectors | python3 -m json.tool
+# Phải thấy: ["postgres-connector"]
+
+curl -s http://localhost:8083/connectors/postgres-connector/status | python3 -m json.tool
+# "state": "RUNNING"
+```
+
+### MinIO
+```bash
+# Mở http://localhost:9001 (minio / minio123)
+# Phải thấy bucket "warehouse" đã được tạo
+```
+
+### FastAPI
+```bash
+curl http://localhost:8000/health
+# {"status": "ok"}
+```
+
+### Trino
+```bash
+curl -s http://localhost:8080/v1/info | python3 -m json.tool
+# "starting": false
+```
+
+## Xử lý lỗi thường gặp
+
+### Nessie unhealthy — OIDC error
+```bash
+# Đảm bảo docker-compose.yaml có 2 env vars này trong service nessie:
+#   QUARKUS_OIDC_ENABLED: "false"
+#   NESSIE_SERVER_AUTHENTICATION_ENABLED: "false"
+# Sau đó:
+docker exec postgres psql -U postgres -c "CREATE DATABASE nessiedb;"
+docker compose restart nessie
+```
+
+### Flink job không submit được
+```bash
+# Xem logs để debug
+docker logs flink-jobmanager --tail 50
+docker logs flink-taskmanager --tail 50
+
+# Thường do Nessie hoặc MinIO chưa healthy
+docker compose ps nessie minio
+```
+
+### Spark không chạy được job
+```bash
+docker logs spark-master --tail 30
+# Nếu thấy "no resources available" → spark-worker chưa kết nối
+docker compose restart spark-worker
+```
+
+### PostgreSQL volume cũ — init.sql không chạy lại
+```bash
+# Xóa volume và khởi động lại (MẤT DATA hiện có)
+docker compose down -v
+docker compose up -d
+```
+
+## Reset hoàn toàn
+
+```bash
+# Dừng và xóa toàn bộ (kể cả volumes)
+docker compose down -v
+
+# Khởi động lại từ đầu
+docker compose up -d
+```

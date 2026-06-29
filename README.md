@@ -1,64 +1,135 @@
-# Realtime Data Streaming Pipeline
+# Realtime Data Streaming — Medallion Architecture
 
-Pipeline xử lý dữ liệu real-time theo **Medallion Architecture** (Bronze → Silver → Gold).
+Pipeline xử lý dữ liệu realtime theo Medallion Architecture (Bronze → Silver → Gold) trên Apache Flink, Apache Spark, Apache Iceberg, và Trino.
+
+## Kiến trúc tổng quan
 
 ```
-Kafka → Flink → Bronze ──(dbt 15 phút)──► Silver ──► Gold
-                  │                                    │
-            query real-time                    query business
-            (30s latency)                      (processed)
+┌──────────────────────────────────────────────────────────────────┐
+│                        INGESTION SOURCES                         │
+│                                                                  │
+│   ┌──────────────┐            ┌────────────────────────────┐    │
+│   │   FastAPI    │            │       PostgreSQL 15         │    │
+│   │  POST /users │            │  WAL → Debezium CDC         │    │
+│   └──────┬───────┘            └────────────┬───────────────┘    │
+└──────────┼─────────────────────────────────┼────────────────────┘
+           │ users_created                   │ postgres.public.users
+           ▼                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      Apache Kafka (KRaft)                        │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ stream liên tục
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Apache Flink 1.17.2                           │
+│            checkpoint 30s → commit Iceberg files                 │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  BRONZE  (raw, append-only)                      │
+│  iceberg.bronze.api_users_raw    iceberg.bronze.cdc_users_raw   │
+│                 MinIO  s3://warehouse/  (Parquet)                │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ Spark batch (15 phút)
+                               │ MERGE INTO  (incremental upsert)
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  SILVER  (clean, deduplicated)                   │
+│  iceberg.silver.api_users        iceberg.silver.cdc_users       │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ Spark batch (sau Silver)
+                               │ Full rebuild
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  GOLD  (business-ready)                          │
+│  iceberg.gold.users_enriched     iceberg.gold.user_stats        │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ SQL
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                       Trino 435                                  │
+│         đọc tất cả layers qua Nessie REST catalog               │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
----
+## Stack công nghệ
+
+| Thành phần | Version | Vai trò |
+|------------|---------|---------|
+| Apache Flink | 1.17.2 | Stream processing, ghi Bronze |
+| Apache Kafka | 7.4.0 (Confluent) | Message broker (KRaft, không ZooKeeper) |
+| Debezium | 2.4 | PostgreSQL CDC → Kafka |
+| Apache Iceberg | 1.5.2 | Table format (ACID, schema evolution, time-travel) |
+| Apache Spark | 3.5.1 | Batch transform: Bronze→Silver→Gold |
+| Project Nessie | 0.76.3 | Iceberg REST catalog (metadata store) |
+| MinIO | latest | Object storage S3-compatible |
+| Trino | 435 | Distributed SQL query engine |
+| FastAPI | — | HTTP ingestion API |
+| PostgreSQL | 15 | Source DB (CDC) + Nessie metadata store |
+
+## Ports
+
+| Service | Port | URL |
+|---------|------|-----|
+| FastAPI | 8000 | http://localhost:8000/docs |
+| Flink Web UI | 18081 | http://localhost:18081 |
+| Spark Web UI | 8090 | http://localhost:8090 |
+| Trino Web UI | 8080 | http://localhost:8080 |
+| MinIO Console | 9001 | http://localhost:9001 (minio / minio123) |
+| Nessie API | 19120 | http://localhost:19120/iceberg |
+| PostgreSQL | 5555 | localhost:5555/mydb (postgres/postgres) |
+| Kafka | 9092 | localhost:9092 |
 
 ## Tài liệu
 
 | Tài liệu | Mô tả |
 |----------|-------|
-| [Kiến trúc](docs/architecture.md) | Sơ đồ tổng quan, luồng data, lý do chọn công nghệ |
-| [Cài đặt & Khởi động](docs/setup.md) | Hướng dẫn chạy từng bước, verify, rebuild |
-| **Layers** | |
-| [Bronze](docs/layers/bronze.md) | Raw data — schema, query operational data |
-| [Silver](docs/layers/silver.md) | Clean data — incremental merge, deduplication |
-| [Gold](docs/layers/gold.md) | Business data — join, aggregation, lineage |
-| **Components** | |
-| [Flink](docs/components/flink.md) | JAR cần thiết, pipeline config, tuning |
-| [Kafka & Debezium](docs/components/kafka.md) | Topics, CDC format, quản lý connector |
-| [Trino](docs/components/trino.md) | Query guide, time travel, metadata tables |
-| [dbt](docs/components/dbt.md) | Materialization, incremental, troubleshooting |
-| [Ingestion](docs/components/ingestion.md) | FastAPI, Airflow DAG, CDC |
-
----
+| [Kiến trúc chi tiết](docs/architecture.md) | Data flow, lý do chọn công nghệ, quyết định thiết kế |
+| [Setup & khởi động](docs/setup.md) | Cài đặt từng bước, requirements, verify |
+| [Test end-to-end](docs/testing.md) | Hướng dẫn test toàn bộ luồng có kèm lệnh |
+| [Bronze layer](docs/layers/bronze.md) | Schema, Flink pipeline, query operational data |
+| [Silver layer](docs/layers/silver.md) | Incremental MERGE, dedup, Spark job |
+| [Gold layer](docs/layers/gold.md) | JOIN + aggregation, full rebuild, Spark job |
+| [Flink](docs/components/flink.md) | JARs, catalog config, submit job |
+| [Kafka & Debezium](docs/components/kafka.md) | Topics, CDC format, connector |
+| [Trino](docs/components/trino.md) | Query guide, catalog, time-travel |
+| [Ingestion API](docs/components/ingestion.md) | FastAPI endpoints, schema |
 
 ## Cấu trúc thư mục
 
 ```
 realtime-data-streaming/
-├── ingestion/
-│   ├── api/                    # FastAPI — HTTP push vào Kafka
-│   └── dags/
-│       ├── kafka_stream.py     # Airflow: pull randomuser.me → Kafka (hàng ngày)
-│       └── dbt_pipeline.py     # Airflow: chạy dbt Bronze→Silver→Gold (15 phút)
+├── docker-compose.yaml          # Toàn bộ services
 ├── cdc/
-│   └── postgres-connector.json # Debezium CDC config
+│   └── postgres-connector.json  # Debezium connector config
+├── ingestion/
+│   ├── api/                     # FastAPI HTTP ingestion
+│   │   ├── main.py
+│   │   ├── requirements.txt
+│   │   └── Dockerfile
+│   └── dags/
+│       └── spark_pipeline.py    # Airflow DAG: chạy Spark mỗi 15 phút
 ├── processing/
-│   └── flink/
-│       └── user_processor.py   # Flink job: Kafka → Bronze Iceberg
+│   ├── flink/
+│   │   ├── user_processor.py    # Flink job: Kafka → Bronze Iceberg
+│   │   └── Dockerfile
+│   └── spark/
+│       ├── jobs/
+│       │   ├── spark_session.py # Spark+Iceberg session builder
+│       │   ├── silver_transform.py  # Bronze → Silver (incremental MERGE)
+│       │   └── gold_transform.py    # Silver → Gold (full rebuild)
+│       └── Dockerfile
 ├── storage/
 │   └── postgres/
-│       └── init.sql            # Schema + CREATE DATABASE nessiedb
+│       └── init.sql             # Schema users + CREATE DATABASE nessiedb
 ├── query/
-│   ├── trino/etc/              # Trino config + catalog
-│   ├── dbt/
-│   │   └── models/
-│   │       ├── bronze/         # View → Bronze tables
-│   │       ├── silver/         # Incremental merge (clean)
-│   │       └── gold/           # Full rebuild (business)
-│   └── duckdb/
-│       └── query_minio.py      # Query MinIO trực tiếp (không cần Trino)
+│   ├── trino/etc/               # Trino config + iceberg catalog
+│   └── dbt/                     # dbt-trino (không dùng cho transform chính)
 └── docs/
     ├── architecture.md
     ├── setup.md
+    ├── testing.md
     ├── layers/
     │   ├── bronze.md
     │   ├── silver.md
@@ -67,47 +138,43 @@ realtime-data-streaming/
         ├── flink.md
         ├── kafka.md
         ├── trino.md
-        ├── dbt.md
         └── ingestion.md
 ```
 
----
-
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Khởi động
+# 1. Khởi động toàn bộ stack
 docker compose up -d
 
-# 2. Submit Flink job (ghi vào Bronze)
+# 2. Submit Flink job
 docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
 
-# 3. Đẩy data
-curl -X POST http://localhost:8000/users -H "Content-Type: application/json" \
-  -d '{"first_name":"Test","last_name":"User","gender":"male","postcode":"100000",
-       "email":"test@example.com","username":"testuser",
-       "dob":"1995-01-01T00:00:00Z","phone":"0901234567"}'
+# 3. Gửi thử dữ liệu qua API
+curl -X POST http://localhost:8000/users \
+  -H "Content-Type: application/json" \
+  -d '{"first_name":"Hoang","last_name":"Nguyen","gender":"male","postcode":"100000",
+       "email":"hoang@example.com","username":"hoangnv",
+       "dob":"1995-01-15","phone":"0901234567"}'
 
-# 4. Đợi 30s, query Bronze (operational)
+# 4. Đợi ~30s, query Bronze
 docker exec -it trino trino \
   --execute "SELECT * FROM iceberg.bronze.api_users_raw ORDER BY ingested_at DESC LIMIT 5"
 
-# 5. Chạy dbt → Silver + Gold
-cd query/dbt && dbt run --profiles-dir .
+# 5. Chạy Spark Silver + Gold
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --py-files /opt/spark/jobs/spark_session.py \
+  /opt/spark/jobs/silver_transform.py
 
-# 6. Query Gold (processed)
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --py-files /opt/spark/jobs/spark_session.py \
+  /opt/spark/jobs/gold_transform.py
+
+# 6. Query Gold
 docker exec -it trino trino \
   --execute "SELECT * FROM iceberg.gold.users_enriched LIMIT 5"
 ```
 
----
-
-## UI
-
-| Service       | URL                        |
-|---------------|----------------------------|
-| API Swagger   | http://localhost:8000/docs |
-| Flink Web UI  | http://localhost:18081     |
-| MinIO Console | http://localhost:9001      |
-| Trino Web UI  | http://localhost:8080      |
-| Nessie        | http://localhost:19120     |
+Chi tiết từng bước xem tại [docs/testing.md](docs/testing.md).

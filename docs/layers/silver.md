@@ -2,114 +2,121 @@
 
 ## Mục đích
 
-Silver là lớp **clean data** — lấy raw Bronze, làm sạch và deduplicate. Nguyên tắc:
+Silver là lớp **clean data** — lấy raw từ Bronze, làm sạch, deduplicate, và upsert vào Iceberg table. Chạy batch mỗi 15 phút qua Spark.
 
-- **Normalized**: email lowercase, text trimmed
-- **Deduplicated**: mỗi `username` / `id` chỉ có 1 record (latest)
-- **Validated**: loại bỏ NULL ở các field quan trọng
-- **Incremental**: chỉ xử lý data mới từ Bronze — không scan lại toàn bộ
-
----
+Nguyên tắc:
+- **Idempotent**: chạy đi chạy lại nhiều lần vẫn cho kết quả giống nhau
+- **Incremental**: chỉ xử lý records mới hơn watermark (MAX ingested_at) trong Silver
+- **No DELETE**: CDC delete events bị lọc, Silver chỉ giữ trạng thái cuối cùng của các records tồn tại
+- **Upsert by unique key**: `username` cho api_users, `id` cho cdc_users
 
 ## Tables
 
 ### `iceberg.silver.api_users`
 
-Data API đã clean, một record per `username`.
-
-| Column       | Type    | Transform từ Bronze |
-|--------------|---------|---------------------|
-| `first_name` | STRING  | `TRIM(first_name)` |
-| `last_name`  | STRING  | `TRIM(last_name)` |
-| `full_name`  | STRING  | `CONCAT(first_name, ' ', last_name)` |
-| `gender`     | STRING  | `LOWER(TRIM(gender))` → "male"/"female" |
-| `email`      | STRING  | `LOWER(TRIM(email))` |
-| `username`   | STRING  | `LOWER(TRIM(username))` — **unique key** |
-| `birth_year` | INT     | `TRY_CAST(SUBSTRING(dob,1,4) AS INT)` |
-| `phone`      | STRING  | `TRIM(phone)` |
-| `postcode`   | STRING  | Giữ nguyên |
-| `ingested_at`| TIMESTAMP | Từ Bronze — dùng để incremental |
+| Column | Type | Transform từ Bronze |
+|--------|------|---------------------|
+| first_name | STRING | `TRIM(first_name)` |
+| last_name | STRING | `TRIM(last_name)` |
+| full_name | STRING | `CONCAT_WS(' ', first_name, last_name)` |
+| gender | STRING | `LOWER(TRIM(gender))` |
+| email | STRING | `LOWER(TRIM(email))` |
+| username | STRING | `LOWER(TRIM(username))` — **unique key** |
+| birth_year | INT | `SUBSTRING(dob, 1, 4).cast(Integer)` |
+| phone | STRING | `TRIM(phone)` |
+| postcode | STRING | giữ nguyên |
+| ingested_at | TIMESTAMP | giữ nguyên từ Bronze |
 
 ### `iceberg.silver.cdc_users`
 
-Trạng thái mới nhất của mỗi user trong PostgreSQL.
+| Column | Type | Transform từ Bronze |
+|--------|------|---------------------|
+| id | INT | giữ nguyên — **unique key** |
+| name | STRING | `TRIM(name)` |
+| email | STRING | `LOWER(TRIM(email))` |
+| department | STRING | `TRIM(department)` |
+| op | STRING | giữ nguyên (`c`, `u`, `r` — bỏ `d`) |
+| source_ts | TIMESTAMP | `source_ts_ms / 1000` cast sang Timestamp |
+| ingested_at | TIMESTAMP | giữ nguyên từ Bronze |
 
-| Column      | Type      | Transform từ Bronze |
-|-------------|-----------|---------------------|
-| `id`        | INT       | **unique key** |
-| `name`      | STRING    | `TRIM(name)` |
-| `email`     | STRING    | `LOWER(TRIM(email))` |
-| `department`| STRING    | `TRIM(department)` |
-| `op`        | STRING    | Giữ nguyên (c/u/r) |
-| `source_ts` | TIMESTAMP | Từ `source_ts_ms` |
-| `ingested_at`| TIMESTAMP | Từ Bronze |
+## Logic xử lý
 
----
+### Incremental load
 
-## Cơ chế incremental
+```python
+# Lấy watermark từ Silver
+watermark = spark.table("iceberg.silver.api_users") \
+    .agg(MAX("ingested_at")).collect()[0][0]
 
-Silver dùng dbt incremental strategy `merge`:
+# Chỉ lấy Bronze records mới hơn watermark
+bronze = bronze.filter(col("ingested_at") > watermark)
+```
 
-```sql
--- Mỗi lần dbt chạy, chỉ load rows MỚI HƠN max(ingested_at) trong Silver
-WHERE ingested_at > (
-  SELECT COALESCE(MAX(ingested_at), TIMESTAMP '1970-01-01 00:00:00')
-  FROM this   -- this = bảng Silver hiện tại
+Lần đầu chạy (Silver trống): `watermark = None` → lấy toàn bộ Bronze.
+
+### Dedup trong batch
+
+```python
+# Nếu cùng username xuất hiện nhiều lần trong batch, chỉ giữ record mới nhất
+.withColumn("_rank",
+    row_number().over(
+        Window.partitionBy("username").orderBy(col("ingested_at").desc())
+    )
 )
+.filter(col("_rank") == 1)
 ```
 
-Khi merge theo `unique_key = 'username'`:
-- Nếu username chưa có → INSERT mới
-- Nếu username đã có → UPDATE (giữ record mới nhất)
-
-Kết quả: Silver luôn chứa trạng thái mới nhất của mỗi user, không có duplicate.
-
----
-
-## Lịch chạy
-
-Airflow DAG `dbt_medallion_pipeline` chạy Silver mỗi **15 phút**:
-
-```
-t=0:00  dbt run --select silver.*
-t=0:15  dbt run --select silver.*
-t=0:30  dbt run --select silver.*
-...
-```
-
----
-
-## Query Silver
+### MERGE INTO (upsert)
 
 ```sql
--- Users đã được clean
-SELECT * FROM iceberg.silver.api_users LIMIT 10;
+MERGE INTO iceberg.silver.api_users t
+USING silver_api_updates s ON t.username = s.username
+WHEN MATCHED     THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+```
 
--- Kiểm tra không có duplicate
-SELECT username, COUNT(*) AS cnt
+## Chạy Spark Silver
+
+```bash
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --py-files /opt/spark/jobs/spark_session.py \
+  /opt/spark/jobs/silver_transform.py
+```
+
+## Query Silver (Trino)
+
+```bash
+docker exec -it trino trino
+```
+
+```sql
+-- API users đã normalize
+SELECT username, full_name, email, gender, birth_year
+FROM iceberg.silver.api_users
+ORDER BY username;
+
+-- CDC users (không có DELETE)
+SELECT id, name, email, department, op
+FROM iceberg.silver.cdc_users
+ORDER BY id;
+
+-- Verify không có duplicate
+SELECT username, COUNT(*) as cnt
 FROM iceberg.silver.api_users
 GROUP BY username
-HAVING cnt > 1;
+HAVING COUNT(*) > 1;
+-- Phải trả về 0 rows
 
--- Trạng thái mới nhất của users trong DB
-SELECT * FROM iceberg.silver.cdc_users
-ORDER BY ingested_at DESC LIMIT 10;
-
--- Users có trong API nhưng không có trong DB
-SELECT a.username, a.email
-FROM iceberg.silver.api_users a
-LEFT JOIN iceberg.silver.cdc_users c ON LOWER(a.email) = LOWER(c.email)
-WHERE c.id IS NULL;
+-- So sánh Bronze vs Silver
+SELECT
+  (SELECT COUNT(*) FROM iceberg.bronze.api_users_raw) as bronze_count,
+  (SELECT COUNT(*) FROM iceberg.silver.api_users)     as silver_count;
+-- Bronze >= Silver (Bronze append-only, Silver deduplicated)
 ```
 
----
+## Tần suất chạy
 
-## Sự khác biệt Bronze vs Silver
+Airflow DAG `spark_medallion_pipeline` chạy Silver job mỗi **15 phút**. Gold chạy ngay sau khi Silver hoàn thành.
 
-| Vấn đề           | Bronze                         | Silver                          |
-|------------------|--------------------------------|---------------------------------|
-| "Nguyen Van A "  | Giữ nguyên (có khoảng trắng)  | Đã `TRIM` → "Nguyen Van A"     |
-| "MALE" vs "male" | Cả hai tồn tại                | Chuẩn hóa → "male"             |
-| Duplicate username| Nhiều rows cùng username      | Chỉ 1 row (latest)             |
-| `op='d'` (delete)| Có trong Bronze                | Bị loại → Silver không có      |
-| `dob` dạng string| "1995-01-01T00:00:00Z"         | `birth_year = 1995` (INT)      |
+Có thể chạy thủ công bất cứ lúc nào — Spark Silver là idempotent.
