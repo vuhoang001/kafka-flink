@@ -189,21 +189,27 @@ services:
   # NESSIE - Iceberg REST catalog (metadata)
   # ─────────────────────────────────────────
   nessie:
-    image: projectnessie/nessie:0.76.3
+    image: projectnessie/nessie:0.82.0
     container_name: nessie
     ports:
       - "19120:19120"   # API: http://localhost:19120/iceberg
     environment:
-      # Dùng PostgreSQL làm backing store (persist khi restart)
-      # nessiedb tách riêng khỏi mydb để tránh conflict với Debezium WAL
       NESSIE_VERSION_STORE_TYPE: JDBC
       QUARKUS_DATASOURCE_DB_KIND: postgresql
       QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/nessiedb
       QUARKUS_DATASOURCE_USERNAME: postgres
       QUARKUS_DATASOURCE_PASSWORD: postgres
-      # Tắt OIDC authentication (không cần cho dev)
       QUARKUS_OIDC_ENABLED: "false"
       NESSIE_SERVER_AUTHENTICATION_ENABLED: "false"
+      # Kích hoạt Iceberg REST catalog — cần đặt warehouse mới có /iceberg/v1/config
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES__WAREHOUSE__LOCATION: "s3://warehouse/"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: "http://minio:9000"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
+      AWS_REGION: us-east-1
     networks:
       - confluent
     depends_on:

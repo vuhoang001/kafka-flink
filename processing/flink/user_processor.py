@@ -36,16 +36,13 @@ def main():
 
     t_env = StreamTableEnvironment.create(env)
 
-    # ── Iceberg catalog via Nessie native API ────────────────────────────
-    # Dùng catalog-type=nessie (Nessie API v2) thay vì rest, vì Nessie 0.76.x
-    # không serve Iceberg REST endpoint /iceberg/v1/config nếu không cấu hình warehouse server-side.
+    # ── Iceberg catalog via Nessie Iceberg REST ──────────────────────────
     t_env.execute_sql("""
         CREATE CATALOG iceberg WITH (
             'type'                 = 'iceberg',
-            'catalog-type'         = 'nessie',
-            'uri'                  = 'http://nessie:19120/api/v2',
-            'ref'                  = 'main',
-            'warehouse'            = 's3://warehouse/',
+            'catalog-type'         = 'rest',
+            'uri'                  = 'http://nessie:19120/iceberg',
+            'warehouse'            = 'warehouse',
             'io-impl'              = 'org.apache.iceberg.aws.s3.S3FileIO',
             's3.endpoint'          = 'http://minio:9000',
             's3.access-key-id'     = 'minio',
