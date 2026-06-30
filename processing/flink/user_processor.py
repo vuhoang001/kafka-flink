@@ -36,13 +36,12 @@ def main():
 
     t_env = StreamTableEnvironment.create(env)
 
-    # ── Iceberg catalog via Nessie Iceberg REST ──────────────────────────
+    # ── Iceberg REST catalog (tabulario/iceberg-rest) ────────────────────
     t_env.execute_sql("""
         CREATE CATALOG iceberg WITH (
             'type'                 = 'iceberg',
             'catalog-type'         = 'rest',
-            'uri'                  = 'http://nessie:19120/iceberg',
-            'warehouse'            = 'warehouse',
+            'uri'                  = 'http://iceberg-rest:8181',
             'io-impl'              = 'org.apache.iceberg.aws.s3.S3FileIO',
             's3.endpoint'          = 'http://minio:9000',
             's3.access-key-id'     = 'minio',
