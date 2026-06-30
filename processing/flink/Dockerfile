@@ -24,24 +24,30 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
     -O /opt/flink/lib/hadoop-hdfs-client.jar
 
-# Transitive deps thiếu của hadoop-common 3.3.4 (phải thêm thủ công vì Flink không đóng gói):
+# Transitive deps thiếu của hadoop-common 3.3.4:
 #
-# Hadoop 3.3.x KHÔNG dùng com.google.common.* (Guava thông thường) nữa.
-# Thay vào đó, Hadoop tạo package riêng org.apache.hadoop.thirdparty.com.google.common.*
-# trong artifact "hadoop-shaded-guava". Configuration.<clinit> dùng class này ngay lập tức.
+# hadoop-shaded-guava: Hadoop 3.3.x dùng org.apache.hadoop.thirdparty.com.google.common.*
+#   thay vì com.google.common.* (Guava chuẩn). Configuration.<clinit> cần ngay lập tức.
+# woodstox-core + stax2-api: Woodstox XML parser cho core-default.xml
 #
-# Chain lỗi đã trace qua client log:
-#   HadoopUtils.<clinit> → Text.<clinit> → WritableComparator → new Configuration()
-#   → Configuration.<clinit>(line 525) → DeprecationDelta → Preconditions.checkNotNull()
-#   → ClassNotFoundException: org.apache.hadoop.thirdparty.com.google.common.base.Preconditions
-#
-# woodstox-core + stax2-api: Hadoop dùng Woodstox để parse XML config files (core-default.xml)
+# KHÔNG thêm hadoop-auth: nó cho phép UGI init tiến xa hơn rồi crash bằng Error không bị catch
+# → HadoopModule.install() ném NoClassDefFoundError (Error, không phải Exception)
+# → Flink không catch → JobManager/client process chết.
+# Thay vào đó, ta disable HadoopModuleFactory hoàn toàn bên dưới.
 RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar \
     -O /opt/flink/lib/hadoop-shaded-guava.jar && \
     wget -q https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.2.4/woodstox-core-6.2.4.jar \
     -O /opt/flink/lib/woodstox-core.jar && \
     wget -q https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.1/stax2-api-4.2.1.jar \
     -O /opt/flink/lib/stax2-api.jar
+
+# Disable HadoopSecurityModule: HadoopModule.install() gọi UGI.setConfiguration() vốn cần
+# toàn bộ Kerberos deps (hadoop-auth, kerb4j, ...) không có trong Flink base image.
+# Ta không cần Kerberos — dùng REST catalog + S3FileIO với AWS credentials thuần túy.
+# Khi Iceberg gọi HadoopUtils.getHadoopConfiguration() trực tiếp, UGI không bao giờ được invoke;
+# chỉ cần Configuration.<clinit> (đã fix bằng hadoop-shaded-guava) là đủ.
+RUN echo "" >> /opt/flink/conf/flink-conf.yaml && \
+    echo "security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory" >> /opt/flink/conf/flink-conf.yaml
 
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
