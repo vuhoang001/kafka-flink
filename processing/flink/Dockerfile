@@ -19,10 +19,15 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle
     -O /opt/flink/lib/iceberg-aws-bundle-1.5.2.jar
 
 # hadoop-common + hadoop-hdfs-client — Iceberg 1.5.2 FlinkCatalogFactory trực tiếp dùng HdfsConfiguration
+# hadoop-auth — UserGroupInformation.<clinit> gọi KerberosName.setRules() (luôn chạy, kể cả SIMPLE mode)
+#   → thiếu hadoop-auth thì UGI static init fail → mọi dùng UGI sau đó ném NoClassDefFoundError
+#   → với hadoop-auth, UGI init thành công, isSecurityEnabled() = false, delegationTokensRequired() = false
 RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar \
     -O /opt/flink/lib/hadoop-common.jar && \
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
-    -O /opt/flink/lib/hadoop-hdfs-client.jar
+    -O /opt/flink/lib/hadoop-hdfs-client.jar && \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-auth/3.3.4/hadoop-auth-3.3.4.jar \
+    -O /opt/flink/lib/hadoop-auth.jar
 
 # Transitive deps thiếu của hadoop-common 3.3.4:
 #
