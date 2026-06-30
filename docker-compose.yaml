@@ -189,7 +189,7 @@ services:
   # NESSIE - Iceberg REST catalog (metadata)
   # ─────────────────────────────────────────
   nessie:
-    image: projectnessie/nessie:0.82.0
+    image: projectnessie/nessie:latest
     container_name: nessie
     ports:
       - "19120:19120"   # API: http://localhost:19120/iceberg
