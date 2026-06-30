@@ -10,76 +10,34 @@ RUN pip3 install apache-flink==1.17.2 --no-cache-dir
 # Kafka SQL connector
 COPY flink-sql-connector-kafka-1.17.2.jar /opt/flink/lib/
 
-# Iceberg Flink runtime 1.5.2 — phiên bản cuối hỗ trợ Flink 1.17 (1.6.x đã drop)
+# Iceberg Flink runtime 1.5.2 (phiên bản cuối hỗ trợ Flink 1.17)
 RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.17/1.5.2/iceberg-flink-runtime-1.17-1.5.2.jar \
     -O /opt/flink/lib/iceberg-flink-runtime-1.17-1.5.2.jar
 
-# AWS bundle — dùng S3FileIO thay vì HadoopFileIO, tránh classloader conflict với S3A plugin
+# Iceberg AWS bundle — S3FileIO, tránh dùng HadoopFileIO
 RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.5.2/iceberg-aws-bundle-1.5.2.jar \
     -O /opt/flink/lib/iceberg-aws-bundle-1.5.2.jar
 
-# hadoop-common + hadoop-hdfs-client — Iceberg 1.5.2 FlinkCatalogFactory trực tiếp dùng HdfsConfiguration
-# hadoop-auth — UserGroupInformation.<clinit> gọi KerberosName.setRules() (luôn chạy, kể cả SIMPLE mode)
-#   → thiếu hadoop-auth thì UGI static init fail → mọi dùng UGI sau đó ném NoClassDefFoundError
-#   → với hadoop-auth, UGI init thành công, isSecurityEnabled() = false, delegationTokensRequired() = false
+# Hadoop deps — Iceberg FlinkCatalogFactory cần HdfsConfiguration + transitive deps
 RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar \
-    -O /opt/flink/lib/hadoop-common.jar && \
+        -O /opt/flink/lib/hadoop-common.jar && \
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
-    -O /opt/flink/lib/hadoop-hdfs-client.jar && \
+        -O /opt/flink/lib/hadoop-hdfs-client.jar && \
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-auth/3.3.4/hadoop-auth-3.3.4.jar \
-    -O /opt/flink/lib/hadoop-auth.jar
-
-# Transitive deps thiếu của hadoop-common 3.3.4:
-#
-# hadoop-shaded-guava: Hadoop 3.3.x dùng org.apache.hadoop.thirdparty.com.google.common.*
-#   thay vì com.google.common.* (Guava chuẩn). Configuration.<clinit> cần ngay lập tức.
-# woodstox-core + stax2-api: Woodstox XML parser cho core-default.xml
-#
-# KHÔNG thêm hadoop-auth: nó cho phép UGI init tiến xa hơn rồi crash bằng Error không bị catch
-# → HadoopModule.install() ném NoClassDefFoundError (Error, không phải Exception)
-# → Flink không catch → JobManager/client process chết.
-# Thay vào đó, ta disable HadoopModuleFactory hoàn toàn bên dưới.
-RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar \
-    -O /opt/flink/lib/hadoop-shaded-guava.jar && \
+        -O /opt/flink/lib/hadoop-auth.jar && \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar \
+        -O /opt/flink/lib/hadoop-shaded-guava.jar && \
     wget -q https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.2.4/woodstox-core-6.2.4.jar \
-    -O /opt/flink/lib/woodstox-core.jar && \
+        -O /opt/flink/lib/woodstox-core.jar && \
     wget -q https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.1/stax2-api-4.2.1.jar \
-    -O /opt/flink/lib/stax2-api.jar
+        -O /opt/flink/lib/stax2-api.jar
 
-# Có HAI nơi trong Flink 1.17 cố gọi UserGroupInformation (UGI) khi startup:
-#
-# 1. HadoopModule.install() — tắt bằng security.module.factory.classes
-# 2. HadoopFSDelegationTokenProvider.delegationTokensRequired() — được gọi trong
-#    DefaultDelegationTokenManager.obtainDelegationTokens() khi JobManager init services
-#    Tắt bằng security.kerberos.token.provider.hadoopfs.enabled: false
-#
-# Không thêm hadoop-auth vì nó cho phép UGI init tiến xa hơn nhưng vẫn crash,
-# và error đó (NoClassDefFoundError) là Error không bị Flink catch → process chết.
-# Ta không cần UGI/Kerberos: dùng REST catalog + S3FileIO với credentials thuần túy.
+# Tắt Hadoop security module và delegation token manager
+# security.delegation.tokens.enabled: false — tắt DefaultDelegationTokenManager hoàn toàn,
+# HadoopFSDelegationTokenProvider sẽ không bao giờ được gọi → UGI không bị khởi động
 RUN echo "" >> /opt/flink/conf/flink-conf.yaml && \
     echo "security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory" >> /opt/flink/conf/flink-conf.yaml && \
-    echo "security.kerberos.token.provider.hadoopfs.enabled: false" >> /opt/flink/conf/flink-conf.yaml
-
-# Xóa HadoopFSDelegationTokenProvider khỏi SPI trong flink-dist.jar.
-# Provider này gọi UserGroupInformation.isSecurityEnabled() khi khởi động,
-# nhưng hadoop-auth (chứa KerberosName mà UGI cần) không đủ deps trong môi trường này.
-# Ta không dùng HDFS delegation tokens (dùng S3FileIO qua iceberg-aws-bundle),
-# nên bỏ provider này hoàn toàn an toàn.
-RUN python3 -c "
-import zipfile, shutil
-src = '/opt/flink/lib/flink-dist-1.17.2.jar'
-tmp = '/tmp/flink-dist-patched.jar'
-spi = 'META-INF/services/org.apache.flink.runtime.security.token.DelegationTokenProvider'
-with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
-    for item in zin.infolist():
-        data = zin.read(item.filename)
-        if item.filename == spi:
-            lines = [l for l in data.decode().splitlines() if 'HadoopFS' not in l]
-            data = '\n'.join(lines).encode()
-        zout.writestr(item, data)
-shutil.move(tmp, src)
-print('Patched: HadoopFSDelegationTokenProvider removed from SPI')
-"
+    echo "security.delegation.tokens.enabled: false" >> /opt/flink/conf/flink-conf.yaml
 
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
