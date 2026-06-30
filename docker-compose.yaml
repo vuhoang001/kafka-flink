@@ -40,18 +40,17 @@ services:
     ports:
       - "5555:5432"
     environment:
-      POSTGRES_DB: mydb
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_HOST_AUTH_METHOD: md5
-    # wal_level=logical bắt buộc để Debezium đọc được WAL
     command: postgres -c wal_level=logical
     volumes:
       - ./storage/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - confluent
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -65,7 +64,7 @@ services:
     ports:
       - "8083:8083"
     environment:
-      BOOTSTRAP_SERVERS: broker:29092
+      BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       GROUP_ID: debezium-group
       CONFIG_STORAGE_TOPIC: debezium_connect_configs
       OFFSET_STORAGE_TOPIC: debezium_connect_offsets
@@ -86,7 +85,6 @@ services:
       timeout: 10s
       retries: 10
 
-  # Đăng ký Debezium connector tự động sau khi kafka-connect sẵn sàng
   connector-init:
     image: confluentinc/cp-kafka:7.4.0
     container_name: connector-init
@@ -96,7 +94,7 @@ services:
     command:
       - -c
       - |
-        kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+        kafka-topics --bootstrap-server ${KAFKA_BOOTSTRAP_SERVERS} --create --if-not-exists \
           --topic users_created --partitions 1 --replication-factor 1
         curl -s -X POST http://kafka-connect:8083/connectors \
           -H "Content-Type: application/json" \
@@ -117,11 +115,11 @@ services:
     image: minio/minio:latest
     container_name: minio
     ports:
-      - "9000:9000"   # API endpoint (Flink ghi vào đây)
-      - "9001:9001"   # Web Console: http://localhost:9001
+      - "9000:9000"
+      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio123
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -133,15 +131,14 @@ services:
       timeout: 5s
       retries: 5
 
-  # Tạo bucket "warehouse" sau khi MinIO khởi động
   minio-init:
     image: minio/mc:latest
     container_name: minio-init
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minio minio123 &&
-      mc mb --ignore-existing local/warehouse &&
-      echo 'Bucket warehouse created.'
+      mc alias set local ${MINIO_ENDPOINT} ${MINIO_USER} ${MINIO_PASSWORD} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET} &&
+      echo 'Bucket ${MINIO_BUCKET} created.'
       "
     networks:
       - confluent
@@ -150,7 +147,36 @@ services:
         condition: service_healthy
 
   # ─────────────────────────────────────────
-  # SPARK CLUSTER - xử lý Bronze → Silver → Gold
+  # ICEBERG REST CATALOG
+  # ─────────────────────────────────────────
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: s3://${MINIO_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: ${MINIO_ENDPOINT}
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_S3_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+    networks:
+      - confluent
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8181'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ─────────────────────────────────────────
+  # SPARK CLUSTER
   # ─────────────────────────────────────────
   spark-master:
     build: ./processing/spark
@@ -158,8 +184,15 @@ services:
     hostname: spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
-      - "7077:7077"    # Spark master port (spark-submit connect vào đây)
-      - "8090:8080"    # Spark Web UI: http://localhost:8090
+      - "7077:7077"
+      - "8090:8080"
+    environment:
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     volumes:
       - ./processing/spark/jobs:/opt/spark/jobs
     networks:
@@ -178,6 +211,12 @@ services:
     environment:
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     volumes:
       - ./processing/spark/jobs:/opt/spark/jobs
     networks:
@@ -186,42 +225,20 @@ services:
       - spark-master
 
   # ─────────────────────────────────────────
-  # ICEBERG REST CATALOG
-  # ─────────────────────────────────────────
-  iceberg-rest:
-    image: tabulario/iceberg-rest:latest
-    container_name: iceberg-rest
-    ports:
-      - "8181:8181"
-    environment:
-      CATALOG_WAREHOUSE: s3://warehouse/
-      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
-      CATALOG_S3_PATH__STYLE__ACCESS: "true"
-      CATALOG_S3_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio123
-      AWS_REGION: us-east-1
-    networks:
-      - confluent
-    depends_on:
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8181'"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  # ─────────────────────────────────────────
   # TRINO - SQL query engine đọc Iceberg
   # ─────────────────────────────────────────
   trino:
     image: trinodb/trino:435
     container_name: trino
     ports:
-      - "8080:8080"   # Web UI + JDBC: http://localhost:8080
+      - "8080:8080"
+    environment:
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     volumes:
       - ./query/trino/etc:/etc/trino
     networks:
@@ -245,6 +262,8 @@ services:
     container_name: user-api
     ports:
       - "8888:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - confluent
     depends_on:
@@ -265,20 +284,24 @@ services:
     hostname: flink-jobmanager
     command: jobmanager
     ports:
-      - "18081:8081"   # Flink Web UI: http://localhost:18081
+      - "18081:8081"
     environment:
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio123
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         rest.port: 8081
         security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory
         security.kerberos.token.provider.hadoopfs.enabled: false
         security.delegation.tokens.enabled: false
-        s3.endpoint: http://minio:9000
-        s3.access-key: minio
-        s3.secret-key: minio123
+        s3.endpoint: ${MINIO_ENDPOINT}
+        s3.access-key: ${AWS_ACCESS_KEY_ID}
+        s3.secret-key: ${AWS_SECRET_ACCESS_KEY}
         s3.path.style.access: true
     volumes:
       - ./processing/flink:/opt/flink/jobs
@@ -296,9 +319,13 @@ services:
     hostname: flink-taskmanager
     command: taskmanager
     environment:
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio123
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
@@ -306,9 +333,9 @@ services:
         security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory
         security.kerberos.token.provider.hadoopfs.enabled: false
         security.delegation.tokens.enabled: false
-        s3.endpoint: http://minio:9000
-        s3.access-key: minio
-        s3.secret-key: minio123
+        s3.endpoint: ${MINIO_ENDPOINT}
+        s3.access-key: ${AWS_ACCESS_KEY_ID}
+        s3.secret-key: ${AWS_SECRET_ACCESS_KEY}
         s3.path.style.access: true
     networks:
       - confluent

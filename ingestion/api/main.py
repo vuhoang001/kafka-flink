@@ -1,4 +1,5 @@
 import json
+import os
 
 from fastapi import FastAPI, HTTPException
 from kafka import KafkaProducer
@@ -7,8 +8,10 @@ from pydantic import BaseModel, EmailStr
 
 app = FastAPI(title="User Ingest API")
 
+_kafka_servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "broker:29092").split(",")
+
 producer = KafkaProducer(
-    bootstrap_servers=["broker:29092"],
+    bootstrap_servers=_kafka_servers,
     max_block_ms=5000,
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
