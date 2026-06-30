@@ -60,6 +60,27 @@ RUN echo "" >> /opt/flink/conf/flink-conf.yaml && \
     echo "security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory" >> /opt/flink/conf/flink-conf.yaml && \
     echo "security.kerberos.token.provider.hadoopfs.enabled: false" >> /opt/flink/conf/flink-conf.yaml
 
+# Xóa HadoopFSDelegationTokenProvider khỏi SPI trong flink-dist.jar.
+# Provider này gọi UserGroupInformation.isSecurityEnabled() khi khởi động,
+# nhưng hadoop-auth (chứa KerberosName mà UGI cần) không đủ deps trong môi trường này.
+# Ta không dùng HDFS delegation tokens (dùng S3FileIO qua iceberg-aws-bundle),
+# nên bỏ provider này hoàn toàn an toàn.
+RUN python3 -c "
+import zipfile, shutil
+src = '/opt/flink/lib/flink-dist-1.17.2.jar'
+tmp = '/tmp/flink-dist-patched.jar'
+spi = 'META-INF/services/org.apache.flink.runtime.security.token.DelegationTokenProvider'
+with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        data = zin.read(item.filename)
+        if item.filename == spi:
+            lines = [l for l in data.decode().splitlines() if 'HadoopFS' not in l]
+            data = '\n'.join(lines).encode()
+        zout.writestr(item, data)
+shutil.move(tmp, src)
+print('Patched: HadoopFSDelegationTokenProvider removed from SPI')
+"
+
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
     cp /opt/flink/opt/flink-s3-fs-hadoop-*.jar /opt/flink/plugins/s3-fs-hadoop/
