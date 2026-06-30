@@ -41,13 +41,19 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-s
     wget -q https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.1/stax2-api-4.2.1.jar \
     -O /opt/flink/lib/stax2-api.jar
 
-# Disable HadoopSecurityModule: HadoopModule.install() gọi UGI.setConfiguration() vốn cần
-# toàn bộ Kerberos deps (hadoop-auth, kerb4j, ...) không có trong Flink base image.
-# Ta không cần Kerberos — dùng REST catalog + S3FileIO với AWS credentials thuần túy.
-# Khi Iceberg gọi HadoopUtils.getHadoopConfiguration() trực tiếp, UGI không bao giờ được invoke;
-# chỉ cần Configuration.<clinit> (đã fix bằng hadoop-shaded-guava) là đủ.
+# Có HAI nơi trong Flink 1.17 cố gọi UserGroupInformation (UGI) khi startup:
+#
+# 1. HadoopModule.install() — tắt bằng security.module.factory.classes
+# 2. HadoopFSDelegationTokenProvider.delegationTokensRequired() — được gọi trong
+#    DefaultDelegationTokenManager.obtainDelegationTokens() khi JobManager init services
+#    Tắt bằng security.kerberos.token.provider.hadoopfs.enabled: false
+#
+# Không thêm hadoop-auth vì nó cho phép UGI init tiến xa hơn nhưng vẫn crash,
+# và error đó (NoClassDefFoundError) là Error không bị Flink catch → process chết.
+# Ta không cần UGI/Kerberos: dùng REST catalog + S3FileIO với credentials thuần túy.
 RUN echo "" >> /opt/flink/conf/flink-conf.yaml && \
-    echo "security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory" >> /opt/flink/conf/flink-conf.yaml
+    echo "security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory" >> /opt/flink/conf/flink-conf.yaml && \
+    echo "security.kerberos.token.provider.hadoopfs.enabled: false" >> /opt/flink/conf/flink-conf.yaml
 
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
