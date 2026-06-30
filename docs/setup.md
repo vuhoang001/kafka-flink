@@ -54,7 +54,7 @@ kafka-connect     healthy
 connector-init    exited (0)    ← OK, chạy xong rồi thoát
 minio             healthy
 minio-init        exited (0)    ← OK
-nessie            healthy
+iceberg-rest      healthy
 spark-master      Up
 spark-worker      Up
 trino             healthy
@@ -63,29 +63,20 @@ flink-jobmanager  Up
 flink-taskmanager Up
 ```
 
-## Bước 4 — Tạo nessiedb (lần đầu setup)
+## Bước 4 — Verify iceberg-rest
 
-> **Chỉ cần chạy 1 lần** nếu PostgreSQL volume đã tồn tại từ trước (volume cũ không chạy lại init.sql).
+Kiểm tra Iceberg REST catalog đã hoạt động:
 
 ```bash
-docker exec postgres psql -U postgres -c "CREATE DATABASE nessiedb;"
+curl -s http://localhost:8181/v1/config | python3 -m json.tool
 ```
 
-Nếu trả về `ERROR: database "nessiedb" already exists` → bỏ qua, đã có rồi.
-
-Sau đó restart Nessie:
-
-```bash
-docker compose restart nessie
-```
-
-Kiểm tra Nessie healthy:
-
-```bash
-docker logs nessie --tail 20
-# Phải thấy: Nessie API REST service running on ...
-curl -s http://localhost:19120/q/health | python3 -m json.tool
-# "status": "UP"
+Kết quả mong đợi:
+```json
+{
+    "defaults": {},
+    "overrides": {}
+}
 ```
 
 ## Bước 5 — Submit Flink job
@@ -129,7 +120,7 @@ curl -s http://localhost:8083/connectors/postgres-connector/status | python3 -m 
 
 ### FastAPI
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:8888/health
 # {"status": "ok"}
 ```
 
@@ -141,14 +132,12 @@ curl -s http://localhost:8080/v1/info | python3 -m json.tool
 
 ## Xử lý lỗi thường gặp
 
-### Nessie unhealthy — OIDC error
+### iceberg-rest unhealthy
 ```bash
-# Đảm bảo docker-compose.yaml có 2 env vars này trong service nessie:
-#   QUARKUS_OIDC_ENABLED: "false"
-#   NESSIE_SERVER_AUTHENTICATION_ENABLED: "false"
-# Sau đó:
-docker exec postgres psql -U postgres -c "CREATE DATABASE nessiedb;"
-docker compose restart nessie
+docker logs iceberg-rest --tail 30
+# Nếu thấy "Started @...ms" → server đã start, chỉ cần đợi healthcheck pass
+# Nếu lỗi S3 → kiểm tra MinIO healthy trước
+docker compose ps minio
 ```
 
 ### Flink job không submit được
@@ -157,8 +146,8 @@ docker compose restart nessie
 docker logs flink-jobmanager --tail 50
 docker logs flink-taskmanager --tail 50
 
-# Thường do Nessie hoặc MinIO chưa healthy
-docker compose ps nessie minio
+# Thường do iceberg-rest hoặc MinIO chưa healthy
+docker compose ps iceberg-rest minio
 ```
 
 ### Spark không chạy được job

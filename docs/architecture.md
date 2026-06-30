@@ -57,16 +57,16 @@ Dữ liệu nhận từ 2 nguồn:
 
          │  SQL query
          ▼
-[Trino :8080]  đọc tất cả layers qua Nessie REST catalog
+[Trino :8080]  đọc tất cả layers qua Iceberg REST catalog (:8181)
 ```
 
 ## Catalog & Storage
 
 ```
-Nessie REST Catalog (:19120)
+Iceberg REST Catalog (:8181)  —  tabulario/iceberg-rest
   ├── Lưu Iceberg metadata (snapshots, manifests, partition spec, schema)
-  ├── Backing store: PostgreSQL database "nessiedb" (tách riêng khỏi "mydb")
-  └── URI: http://nessie:19120/iceberg  (Flink RESTCatalog tự thêm /v1)
+  ├── Backing store: SQLite in-memory (embedded, không cần DB ngoài)
+  └── URI: http://iceberg-rest:8181
 
 MinIO Object Storage (:9000 API / :9001 Console)
   └── Bucket: warehouse/
@@ -91,12 +91,15 @@ Iceberg 1.6.x đã drop support Flink 1.17. Version 1.5.2 là bản cuối cùng
 ### S3FileIO thay vì s3a:// (HadoopFileIO)
 Flink dùng plugin classloader riêng cho `flink-s3-fs-hadoop`. Nếu Iceberg cùng dùng `s3a://`, 2 classloader conflict → runtime error khi load class. Dùng `S3FileIO` từ `iceberg-aws-bundle` chạy trong classloader riêng, tránh hoàn toàn conflict.
 
-### Nessie thay vì HadoopCatalog
-HadoopCatalog không safe với concurrent write (nhiều Flink task slot ghi cùng lúc). Nessie cung cấp:
-- REST API chuẩn (Iceberg REST Catalog Spec)
+### tabulario/iceberg-rest thay vì HadoopCatalog
+HadoopCatalog không safe với concurrent write (nhiều Flink task slot ghi cùng lúc). `tabulario/iceberg-rest` cung cấp:
+- REST API chuẩn (Iceberg REST Catalog Spec v1)
 - Snapshot isolation cho concurrent write
-- Metadata durable trong PostgreSQL
-- Git-like branching (mặc định branch `main`)
+- Không cần cấu hình database ngoài — nhẹ hơn nhiều so với Nessie
+- Tương thích với `catalog-type = 'rest'` trong cả Flink, Spark, Trino
+
+### security.delegation.tokens.enabled: false (Flink)
+Flink 1.17 có `HadoopFSDelegationTokenProvider` — gọi `UserGroupInformation` khi khởi động. Nếu thiếu Kerberos config, UGI static init fail → `NoClassDefFoundError`. Tắt bằng `security.delegation.tokens.enabled: false` để vô hiệu hóa hoàn toàn `DefaultDelegationTokenManager`.
 
 ### Flink checkpoint 30 giây
 Iceberg là file-based format — data chỉ visible sau khi Flink commit file Parquet hoàn chỉnh. Commit xảy ra sau mỗi checkpoint. 30s là trade-off giữa latency (~30s delay) và số lượng small files.
@@ -112,12 +115,13 @@ dbt-trino chạy SQL qua Trino HTTP — Trino chỉ đọc Iceberg, không hỗ 
 ## Thứ tự khởi động services
 
 ```
-postgres ──────────────────────────────► nessie
-         └─► broker ──► kafka-connect ──► connector-init
-                    └─► minio ──► minio-init
+minio ──────────────────────────────► minio-init
+      └─► iceberg-rest
+      └─► broker ──► kafka-connect ──► connector-init
+                                  └─► postgres ──► kafka-connect
 
-nessie + minio ──► spark-master ──► spark-worker
-nessie + minio ──► trino
-broker + minio ──► flink-jobmanager ──► flink-taskmanager
-broker         ──► api
+minio + iceberg-rest ──► spark-master ──► spark-worker
+minio + iceberg-rest ──► trino
+broker + minio       ──► flink-jobmanager ──► flink-taskmanager
+broker               ──► api
 ```

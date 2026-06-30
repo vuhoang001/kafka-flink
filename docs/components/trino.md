@@ -2,7 +2,7 @@
 
 ## Vai trò
 
-Trino là **distributed SQL query engine** — đọc Iceberg tables từ MinIO qua Nessie catalog bằng ANSI SQL. Không lưu data, chỉ đọc.
+Trino là **distributed SQL query engine** — đọc Iceberg tables từ MinIO qua Iceberg REST catalog bằng ANSI SQL. Không lưu data, chỉ đọc.
 
 ## Kết nối
 
@@ -27,10 +27,11 @@ File: `query/trino/etc/catalog/iceberg.properties`
 ```properties
 connector.name=iceberg
 iceberg.catalog.type=rest
-iceberg.rest-catalog.uri=http://nessie:19120/iceberg
-iceberg.rest-catalog.warehouse=s3a://warehouse/
+iceberg.rest-catalog.uri=http://iceberg-rest:8181
+iceberg.rest-catalog.warehouse=s3://warehouse/
 fs.native-s3.enabled=true
 s3.endpoint=http://minio:9000
+s3.region=us-east-1
 s3.aws-access-key=minio
 s3.aws-secret-key=minio123
 s3.path-style-access=true

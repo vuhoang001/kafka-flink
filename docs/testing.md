@@ -470,9 +470,9 @@ echo "=== DONE ==="
 
 | Vấn đề | Kiểm tra | Fix |
 |--------|----------|-----|
-| Bronze trống sau 30s | `docker logs flink-taskmanager --tail 50` | Xem lỗi Iceberg/S3; kiểm tra Nessie healthy |
-| Flink job không start | `docker logs flink-jobmanager --tail 50` | Check Nessie và MinIO healthy trước |
+| Bronze trống sau 30s | `docker logs flink-taskmanager --tail 50` | Xem lỗi Iceberg/S3; kiểm tra iceberg-rest healthy |
+| Flink job không start | `docker logs flink-jobmanager --tail 50` | Check iceberg-rest và MinIO healthy trước |
 | Spark lỗi connection refused | `docker logs spark-master --tail 30` | `docker compose restart spark-worker` |
-| Nessie unhealthy | `docker logs nessie --tail 30` | Tạo `nessiedb`, thêm `QUARKUS_OIDC_ENABLED=false` |
+| iceberg-rest unhealthy | `docker logs iceberg-rest --tail 30` | Kiểm tra MinIO đã healthy chưa (`docker compose ps minio`) |
 | Silver trống dù Bronze có data | Kiểm tra watermark: query max ingested_at trong Silver | Xóa Silver table để reset watermark nếu cần |
 | Trino lỗi "table not found" | `SHOW TABLES FROM iceberg.bronze` | Flink chưa tạo table hoặc chưa có checkpoint |

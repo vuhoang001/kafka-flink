@@ -21,6 +21,12 @@ Flink là **stream processing engine** — đọc liên tục từ Kafka và ghi
 | `flink-sql-connector-kafka-1.17.2.jar` | Đọc từ Kafka |
 | `iceberg-flink-runtime-1.17-1.5.2.jar` | Iceberg sink cho Flink |
 | `iceberg-aws-bundle-1.5.2.jar` | S3FileIO — ghi vào MinIO |
+| `hadoop-common-3.3.4.jar` | Iceberg FlinkCatalogFactory cần HdfsConfiguration |
+| `hadoop-hdfs-client-3.3.4.jar` | Hadoop HDFS client |
+| `hadoop-auth-3.3.4.jar` | Hadoop auth |
+| `hadoop-shaded-guava-1.1.1.jar` | Transitive dep của Hadoop |
+| `woodstox-core-6.2.4.jar` | XML parser cho Hadoop config |
+| `stax2-api-4.2.1.jar` | Transitive dep của Woodstox |
 
 > `iceberg-aws-bundle` bắt buộc để tránh classloader conflict với `flink-s3-fs-hadoop`. Không dùng `s3a://`, chỉ dùng `s3://` với S3FileIO.
 
@@ -29,21 +35,31 @@ Flink là **stream processing engine** — đọc liên tục từ Kafka và ghi
 ```python
 t_env.execute_sql("""
     CREATE CATALOG iceberg WITH (
-        'type'                  = 'iceberg',
-        'catalog-type'          = 'rest',
-        'uri'                   = 'http://nessie:19120/iceberg',
-        'warehouse'             = 's3://warehouse/',
-        'io-impl'               = 'org.apache.iceberg.aws.s3.S3FileIO',
-        's3.endpoint'           = 'http://minio:9000',
-        's3.access-key-id'      = 'minio',
-        's3.secret-access-key'  = 'minio123',
-        's3.path-style-access'  = 'true',
-        'header.X-Project-Name' = 'main'
+        'type'                 = 'iceberg',
+        'catalog-type'         = 'rest',
+        'uri'                  = 'http://iceberg-rest:8181',
+        'io-impl'              = 'org.apache.iceberg.aws.s3.S3FileIO',
+        's3.endpoint'          = 'http://minio:9000',
+        's3.access-key-id'     = 'minio',
+        's3.secret-access-key' = 'minio123',
+        's3.path-style-access' = 'true'
     )
 """)
 ```
 
-`header.X-Project-Name = 'main'` → Nessie branch name. Tất cả commits vào branch `main`.
+## Flink security config (quan trọng)
+
+Flink 1.17 khởi động `HadoopFSDelegationTokenProvider` ngay khi start — gọi `UserGroupInformation` tĩnh. Nếu thiếu Kerberos, UGI init fail → `NoClassDefFoundError` crash toàn bộ JobManager.
+
+Bắt buộc có 2 config này trong `flink-conf.yaml` và `FLINK_PROPERTIES`:
+
+```yaml
+security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory
+security.delegation.tokens.enabled: false
+```
+
+- `security.delegation.tokens.enabled: false` — tắt `DefaultDelegationTokenManager` hoàn toàn
+- `security.module.factory.classes` — chỉ load JAAS module, không load Hadoop module (tránh UGI call)
 
 ## Submit job
 
@@ -94,9 +110,10 @@ docker logs flink-taskmanager --tail 100
 
 Lỗi thường gặp:
 
-- `NoSuchTableException` → Nessie chưa healthy hoặc `nessiedb` chưa tồn tại
+- `NoSuchTableException` → iceberg-rest chưa healthy hoặc MinIO chưa có bucket `warehouse`
 - `Connection refused: minio:9000` → MinIO chưa healthy
 - `ClassNotFoundException S3FileIO` → thiếu `iceberg-aws-bundle` JAR
+- `NoClassDefFoundError: UserGroupInformation` → thiếu `security.delegation.tokens.enabled: false`
 
 ### Job chạy nhưng Bronze trống
 
