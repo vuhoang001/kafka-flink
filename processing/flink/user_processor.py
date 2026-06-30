@@ -46,7 +46,8 @@ def main():
             's3.endpoint'          = 'http://minio:9000',
             's3.access-key-id'     = 'minio',
             's3.secret-access-key' = 'minio123',
-            's3.path-style-access' = 'true'
+            's3.path-style-access' = 'true',
+            's3.region'            = 'us-east-1'
         )
     """)
     # Bronze: raw data nguyên xi từ Kafka
