@@ -24,6 +24,15 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
     -O /opt/flink/lib/hadoop-hdfs-client.jar
 
+# Transitive deps mà hadoop-common cần nhưng Flink shade nội bộ (không expose ra ngoài):
+# - Guava: Hadoop dùng com.google.common.*, Flink shade thành org.apache.flink.shaded.guava.*
+# - commons-lang3: tương tự bị shade bên trong flink-dist.jar
+# Thiếu 2 thư viện này → hadoop-common init fail → HadoopUtils init fail → NoClassDefFoundError
+RUN wget -q https://repo1.maven.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar \
+    -O /opt/flink/lib/guava.jar && \
+    wget -q https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar \
+    -O /opt/flink/lib/commons-lang3.jar
+
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
     cp /opt/flink/opt/flink-s3-fs-hadoop-*.jar /opt/flink/plugins/s3-fs-hadoop/
