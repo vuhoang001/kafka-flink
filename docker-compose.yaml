@@ -267,6 +267,9 @@ services:
     ports:
       - "18081:8081"   # Flink Web UI: http://localhost:18081
     environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         rest.port: 8081
@@ -293,6 +296,9 @@ services:
     hostname: flink-taskmanager
     command: taskmanager
     environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
