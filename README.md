@@ -49,7 +49,7 @@ Pipeline xử lý dữ liệu realtime theo Medallion Architecture (Bronze → S
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                       Trino 435                                  │
-│         đọc tất cả layers qua Nessie REST catalog               │
+│         đọc tất cả layers qua Iceberg REST catalog              │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,22 +62,22 @@ Pipeline xử lý dữ liệu realtime theo Medallion Architecture (Bronze → S
 | Debezium | 2.4 | PostgreSQL CDC → Kafka |
 | Apache Iceberg | 1.5.2 | Table format (ACID, schema evolution, time-travel) |
 | Apache Spark | 3.5.1 | Batch transform: Bronze→Silver→Gold |
-| Project Nessie | 0.76.3 | Iceberg REST catalog (metadata store) |
+| tabulario/iceberg-rest | latest | Iceberg REST catalog server (metadata store) |
 | MinIO | latest | Object storage S3-compatible |
 | Trino | 435 | Distributed SQL query engine |
 | FastAPI | — | HTTP ingestion API |
-| PostgreSQL | 15 | Source DB (CDC) + Nessie metadata store |
+| PostgreSQL | 15 | Source DB (CDC) |
 
 ## Ports
 
 | Service | Port | URL |
 |---------|------|-----|
-| FastAPI | 8000 | http://localhost:8000/docs |
+| FastAPI | 8888 | http://localhost:8888/docs |
 | Flink Web UI | 18081 | http://localhost:18081 |
 | Spark Web UI | 8090 | http://localhost:8090 |
 | Trino Web UI | 8080 | http://localhost:8080 |
 | MinIO Console | 9001 | http://localhost:9001 (minio / minio123) |
-| Nessie API | 19120 | http://localhost:19120/iceberg |
+| Iceberg REST Catalog | 8181 | http://localhost:8181/v1/config |
 | PostgreSQL | 5555 | localhost:5555/mydb (postgres/postgres) |
 | Kafka | 9092 | localhost:9092 |
 
@@ -116,13 +116,13 @@ realtime-data-streaming/
 │   │   └── Dockerfile
 │   └── spark/
 │       ├── jobs/
-│       │   ├── spark_session.py # Spark+Iceberg session builder
-│       │   ├── silver_transform.py  # Bronze → Silver (incremental MERGE)
-│       │   └── gold_transform.py    # Silver → Gold (full rebuild)
+│       │   ├── spark_session.py         # Spark+Iceberg session builder
+│       │   ├── silver_transform.py      # Bronze → Silver (incremental MERGE)
+│       │   └── gold_transform.py        # Silver → Gold (full rebuild)
 │       └── Dockerfile
 ├── storage/
 │   └── postgres/
-│       └── init.sql             # Schema users + CREATE DATABASE nessiedb
+│       └── init.sql             # Schema users (source cho Debezium CDC)
 ├── query/
 │   ├── trino/etc/               # Trino config + iceberg catalog
 │   └── dbt/                     # dbt-trino (không dùng cho transform chính)
@@ -151,7 +151,7 @@ docker compose up -d
 docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
 
 # 3. Gửi thử dữ liệu qua API
-curl -X POST http://localhost:8000/users \
+curl -X POST http://localhost:8888/users \
   -H "Content-Type: application/json" \
   -d '{"first_name":"Hoang","last_name":"Nguyen","gender":"male","postcode":"100000",
        "email":"hoang@example.com","username":"hoangnv",

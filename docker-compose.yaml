@@ -226,7 +226,7 @@ services:
     networks:
       - confluent
     depends_on:
-      nessie:
+      iceberg-rest:
         condition: service_healthy
       minio:
         condition: service_healthy
