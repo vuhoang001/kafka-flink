@@ -271,6 +271,8 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         rest.port: 8081
+        security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory
+        security.kerberos.token.provider.hadoopfs.enabled: false
         s3.endpoint: http://minio:9000
         s3.access-key: minio
         s3.secret-key: minio123
@@ -295,6 +297,8 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 1
+        security.module.factory.classes: org.apache.flink.runtime.security.modules.JaasModuleFactory
+        security.kerberos.token.provider.hadoopfs.enabled: false
         s3.endpoint: http://minio:9000
         s3.access-key: minio
         s3.secret-key: minio123
