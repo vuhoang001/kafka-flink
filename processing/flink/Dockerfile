@@ -24,14 +24,20 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
     -O /opt/flink/lib/hadoop-hdfs-client.jar
 
-# Transitive deps mà hadoop-common cần nhưng Flink shade nội bộ (không expose ra ngoài):
-# - Guava: Hadoop dùng com.google.common.*, Flink shade thành org.apache.flink.shaded.guava.*
-# - commons-lang3: tương tự bị shade bên trong flink-dist.jar
-# Thiếu 2 thư viện này → hadoop-common init fail → HadoopUtils init fail → NoClassDefFoundError
-RUN wget -q https://repo1.maven.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar \
-    -O /opt/flink/lib/guava.jar && \
-    wget -q https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar \
-    -O /opt/flink/lib/commons-lang3.jar
+# Transitive deps thiếu của hadoop-common (Flink không cung cấp vì shade nội bộ):
+#
+# ROOT CAUSE đã xác định từ client log:
+#   HadoopUtils.<clinit>(line 47) → new Text(...) → Text.<clinit> → WritableComparator
+#   → WritableComparator gọi new Configuration() rồi parse XML → cần Woodstox XML parser
+#   → ClassNotFoundException: com.ctc.wstx.io.InputBootstrapper (class trong woodstox-core)
+#
+# - woodstox-core: fast XML parser, hadoop-common dùng khi parse core-default.xml
+# - stax2-api: StAX2 API mà woodstox-core implement
+# - guava + commons-lang3: đã có sẵn từ Flink base image layer trước
+RUN wget -q https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.2.4/woodstox-core-6.2.4.jar \
+    -O /opt/flink/lib/woodstox-core.jar && \
+    wget -q https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.1/stax2-api-4.2.1.jar \
+    -O /opt/flink/lib/stax2-api.jar
 
 # S3/MinIO filesystem plugin
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
