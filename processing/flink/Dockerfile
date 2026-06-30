@@ -24,17 +24,21 @@ RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar \
     -O /opt/flink/lib/hadoop-hdfs-client.jar
 
-# Transitive deps thiếu của hadoop-common (Flink không cung cấp vì shade nội bộ):
+# Transitive deps thiếu của hadoop-common 3.3.4 (phải thêm thủ công vì Flink không đóng gói):
 #
-# ROOT CAUSE đã xác định từ client log:
-#   HadoopUtils.<clinit>(line 47) → new Text(...) → Text.<clinit> → WritableComparator
-#   → WritableComparator gọi new Configuration() rồi parse XML → cần Woodstox XML parser
-#   → ClassNotFoundException: com.ctc.wstx.io.InputBootstrapper (class trong woodstox-core)
+# Hadoop 3.3.x KHÔNG dùng com.google.common.* (Guava thông thường) nữa.
+# Thay vào đó, Hadoop tạo package riêng org.apache.hadoop.thirdparty.com.google.common.*
+# trong artifact "hadoop-shaded-guava". Configuration.<clinit> dùng class này ngay lập tức.
 #
-# - woodstox-core: fast XML parser, hadoop-common dùng khi parse core-default.xml
-# - stax2-api: StAX2 API mà woodstox-core implement
-# - guava + commons-lang3: đã có sẵn từ Flink base image layer trước
-RUN wget -q https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.2.4/woodstox-core-6.2.4.jar \
+# Chain lỗi đã trace qua client log:
+#   HadoopUtils.<clinit> → Text.<clinit> → WritableComparator → new Configuration()
+#   → Configuration.<clinit>(line 525) → DeprecationDelta → Preconditions.checkNotNull()
+#   → ClassNotFoundException: org.apache.hadoop.thirdparty.com.google.common.base.Preconditions
+#
+# woodstox-core + stax2-api: Hadoop dùng Woodstox để parse XML config files (core-default.xml)
+RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar \
+    -O /opt/flink/lib/hadoop-shaded-guava.jar && \
+    wget -q https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.2.4/woodstox-core-6.2.4.jar \
     -O /opt/flink/lib/woodstox-core.jar && \
     wget -q https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.1/stax2-api-4.2.1.jar \
     -O /opt/flink/lib/stax2-api.jar
