@@ -1,5 +1,5 @@
 """
-Helper tạo SparkSession với Iceberg + Nessie + MinIO config.
+Helper tạo SparkSession với Iceberg REST catalog + MinIO config.
 Import module này trong mọi Spark job.
 """
 
@@ -15,10 +15,10 @@ def get_spark(app_name: str) -> SparkSession:
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
-        # Catalog "iceberg" → Nessie REST catalog
+        # Catalog "iceberg" → Iceberg REST catalog
         .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.iceberg.type", "rest")
-        .config("spark.sql.catalog.iceberg.uri", "http://nessie:19120/iceberg")
+        .config("spark.sql.catalog.iceberg.uri", "http://iceberg-rest:8181")
         .config("spark.sql.catalog.iceberg.warehouse", "s3://warehouse/")
         # S3FileIO — dùng AWS SDK v2 để đọc/ghi MinIO
         .config("spark.sql.catalog.iceberg.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
