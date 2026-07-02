@@ -15,6 +15,8 @@ from airflow.providers.standard.operators.bash import BashOperator
 
 SPARK_MASTER = "spark://spark-master:7077"
 JOBS_DIR     = "/opt/spark/jobs"
+SPARK_SILVER = "silver_transform.py"
+SPARK_GOLD   = "gold_transform.py"
 
 SPARK_SUBMIT = (
     "docker exec spark-master "
@@ -37,7 +39,7 @@ with DAG(
         task_id="spark_silver",
         bash_command=SPARK_SUBMIT.format(
             jobs_dir=JOBS_DIR,
-            job="silver_transform.py",
+            job=SPARK_SILVER,
         ),
     )
 
@@ -45,7 +47,7 @@ with DAG(
         task_id="spark_gold",
         bash_command=SPARK_SUBMIT.format(
             jobs_dir=JOBS_DIR,
-            job="gold_transform.py",
+            job=SPARK_GOLD,
         ),
     )
 
