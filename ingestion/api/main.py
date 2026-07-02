@@ -1,10 +1,10 @@
 import json
 import os
+from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
-from pydantic import BaseModel, EmailStr
 
 app = FastAPI(title="User Ingest API")
 
@@ -17,26 +17,19 @@ producer = KafkaProducer(
 )
 
 
-class UserIn(BaseModel):
-    first_name: str
-    last_name: str
-    gender: str
-    postcode: str
-    email: EmailStr
-    username: str
-    dob: str
-    phone: str
-    picture: str = ""
-
-
 @app.post("/users", status_code=201)
-def create_user(user: UserIn):
+def create_user(payload: dict[str, Any] = Body(...)):
+    """Nhận JSON bất kỳ và đẩy nguyên xi vào Kafka.
+
+    Không validate schema ở đây — Bronze lưu raw (schema-on-read),
+    việc chuẩn hoá cấu trúc là trách nhiệm của bước Bronze → Silver.
+    """
     try:
-        future = producer.send("users_created", user.model_dump())
+        future = producer.send("users_created", payload)
         future.get(timeout=5)
     except KafkaError as e:
         raise HTTPException(status_code=502, detail=f"Kafka error: {e}")
-    return {"status": "ok", "message": f"User {user.username} sent to Kafka"}
+    return {"status": "ok", "message": "Payload sent to Kafka"}
 
 
 @app.get("/health")

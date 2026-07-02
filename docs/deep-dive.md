@@ -15,6 +15,9 @@
 9. [Airflow — người bấm nút theo lịch](#9-airflow)
 10. [Lộ trình tự viết lại bằng tay](#10-lộ-trình-tự-viết-lại-bằng-tay)
 11. [Câu hỏi tự kiểm tra](#11-câu-hỏi-tự-kiểm-tra)
+12. [Bronze schema-on-read — thiết kế hiện tại](#12-bronze-schema-on-read--thiết-kế-hiện-tại)
+
+> **Lưu ý (07/2026):** code đã được đổi sang **Bronze schema-on-read** — Bronze lưu nguyên payload JSON, không parse. Các snippet ở mục 3, 6, 7 minh hoạ phiên bản cũ (schema-on-write, vẫn đúng về khái niệm); thiết kế mới và lý do đổi xem [mục 12](#12-bronze-schema-on-read--thiết-kế-hiện-tại).
 
 ---
 
@@ -703,3 +706,119 @@ Trả lời trôi chảy hết là bạn đã "tường tận". Đáp án đều
 **Tổng hợp**
 18. Kể tên đường đi đầy đủ của một user POST vào API cho đến khi xuất hiện trong `iceberg.gold.users_enriched` — qua những process nào, độ trễ mỗi chặng?
 19. Nếu logic clean ở Silver bị phát hiện sai sau 1 tháng, làm sao sửa lại toàn bộ data mà không mất gì? (gợi ý: Bronze append-only)
+
+---
+
+## 12. Bronze schema-on-read — thiết kế hiện tại
+
+### 12.1. Hai triết lý Bronze
+
+| | Schema-on-**write** (bản cũ) | Schema-on-**read** (bản hiện tại) |
+|---|---|---|
+| Bronze lưu gì | Từng cột đã parse (`first_name`, `email`, ...) | Một cột `payload` chứa nguyên JSON string |
+| Ai định nghĩa schema | Flink (lúc ghi) | Spark Silver (lúc đọc) |
+| Producer thêm field mới | Field bị **vứt bỏ** — Flink chỉ map cột đã khai | Nằm nguyên trong payload, không mất gì |
+| Message "lạ"/sai format | Bị bỏ lặng lẽ (`ignore-parse-errors`) hoặc làm chết job | Vẫn vào Bronze, Silver lọc sau |
+| Thêm nguồn mới | Viết source + sink + insert mới trong Flink | Thêm 1 dòng vào dict `TOPICS` |
+| Chi phí | Query Bronze trực tiếp dễ hơn | Silver phải parse JSON (CPU + code) |
+
+Schema-on-read trung thành với triết lý Bronze hơn: **"lưu tất cả những gì nguồn gửi về, không phán xét"**. Cái giá phải trả duy nhất: mọi hiểu biết về cấu trúc data dồn xuống Silver.
+
+### 12.2. Thay đổi ở từng thành phần
+
+**FastAPI** (`ingestion/api/main.py`) — bỏ Pydantic model, nhận `dict` bất kỳ:
+
+```python
+@app.post("/users", status_code=201)
+def create_user(payload: dict[str, Any] = Body(...)):
+    producer.send("users_created", payload)
+```
+
+Validate duy nhất còn lại: "phải là JSON object hợp lệ" (FastAPI tự trả 422 nếu không). Đây là quyết định có chủ đích: cửa ingest càng dễ dãi, càng không bao giờ mất data; data bẩn để Silver xử.
+
+**DAG fake data** (`kafka_stream.py`) — bỏ hẳn `format_data()`, gửi nguyên object randomuser trả về (đủ cả `location.coordinates`, `registered`, `nat`, ...).
+
+**Flink** (`user_processor.py`) — hai thay đổi cốt lõi:
+
+```sql
+CREATE TABLE api_source (
+    payload         STRING,
+    kafka_topic     STRING           METADATA FROM 'topic'     VIRTUAL,
+    kafka_partition INT              METADATA FROM 'partition' VIRTUAL,
+    kafka_offset    BIGINT           METADATA FROM 'offset'    VIRTUAL,
+    kafka_ts        TIMESTAMP_LTZ(3) METADATA FROM 'timestamp' VIRTUAL
+) WITH ( ..., 'format' = 'raw' )
+```
+
+1. **`'format' = 'raw'`** thay cho `'format' = 'json'`: Flink không parse gì nữa, cả message thành một cột STRING. Không còn `ignore-parse-errors` vì không còn gì để parse lỗi.
+2. **Cột METADATA**: không nằm trong message — do Kafka connector cung cấp (message này ở topic nào, partition nào, offset bao nhiêu, producer gửi lúc nào). `(topic, partition, offset)` định danh duy nhất một message → công cụ trace/dedup quý giá. `VIRTUAL` = cột chỉ đọc, không ghi ngược được vào Kafka.
+
+Vì mọi topic giờ có cùng schema `payload + metadata`, hai pipeline gộp thành **một vòng lặp**:
+
+```python
+TOPICS = {
+    "users_created":         ("api_source", "api_users_raw", "flink-api-group"),
+    "postgres.public.users": ("cdc_source", "cdc_users_raw", "flink-cdc-group"),
+}
+for topic, (source_table, bronze_table, group_id) in TOPICS.items():
+    # CREATE source → CREATE sink → add_insert_sql
+```
+
+Đây là phần thưởng lớn nhất của schema-on-read: **ingest trở thành generic**. Muốn thêm topic `orders_created`? Thêm một dòng vào dict. Cũng bỏ luôn `WHERE after IS NOT NULL` — event DELETE của CDC giờ VẪN vào Bronze (đúng triết lý: Bronze ghi lại mọi thứ đã xảy ra), Silver mới là nơi quyết định bỏ qua nó.
+
+**Spark Silver** (`silver_transform.py`) — khung 5 bước thành 6: **parse → (watermark) → clean → dedup → create → MERGE**. Hai kỹ thuật parse, chọn theo độ ổn định của nguồn:
+
+*Nguồn cấu trúc ổn định (CDC/Debezium)* → `from_json` + schema tường minh:
+
+```python
+CDC_SCHEMA = T.StructType([
+    T.StructField("after", T.StructType([...])),
+    T.StructField("op",    T.StringType()),
+    T.StructField("ts_ms", T.LongType()),
+])
+parsed = bronze.withColumn("d", F.from_json("payload", CDC_SCHEMA)) \
+               .select(F.col("d.after.id").alias("id"), ...)
+```
+
+Parse cả payload một lần thành struct, truy cập field bằng dot-notation. Message hỏng → struct NULL → bị filter loại. Chỉ khai field cần dùng — field khác vẫn ngủ yên trong Bronze, cần thì thêm vào schema rồi chạy lại.
+
+*Nguồn cấu trúc lộn xộn (topic API nhận đủ kiểu payload)* → `get_json_object` + JSONPath + `coalesce`:
+
+```python
+def j(path):
+    return F.get_json_object(F.col("payload"), path)
+
+F.coalesce(j("$.name.first"), j("$.first_name")).alias("first_name"),
+F.coalesce(j("$.dob.date"),   j("$.dob")).alias("dob"),
+```
+
+Topic `users_created` giờ chứa 2 dạng: randomuser raw (lồng nhau, `name.first`) và JSON phẳng ai đó POST tay (`first_name`). `get_json_object` trả NULL khi path không tồn tại, nên `coalesce(dạng_lồng, dạng_phẳng)` tự chọn dạng nào khớp. Đây là bài học quan trọng nhất của schema-on-read: **sự dễ dãi ở cửa vào không biến mất — nó chuyển thành code phòng thủ ở Silver.** Không có bữa trưa miễn phí; cái bạn được là *không bao giờ mất data* và *chọn thời điểm trả nợ*.
+
+### 12.3. Migration khi đổi schema Bronze
+
+`CREATE TABLE IF NOT EXISTS` của Flink **không sửa bảng đã tồn tại** — bảng Bronze cũ (dạng cột) vẫn còn, INSERT schema mới vào sẽ lỗi. Trình tự chuyển đổi:
+
+```bash
+# 1. Cancel Flink job cũ
+docker exec flink-jobmanager flink list
+docker exec flink-jobmanager flink cancel <JOB_ID>
+
+# 2. Drop bảng Bronze cũ (Silver giữ nguyên — schema Silver không đổi)
+docker exec -it trino trino --execute "
+  DROP TABLE IF EXISTS iceberg.bronze.api_users_raw;
+  DROP TABLE IF EXISTS iceberg.bronze.cdc_users_raw"
+
+# 3. Rebuild image API (code bake trong image) + submit lại Flink job
+docker compose build api && docker compose up -d api
+docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
+```
+
+Flink job mới không có checkpoint cũ → `scan.startup.mode = earliest-offset` → **đọc lại toàn bộ message còn trong Kafka retention** → Bronze mới được "tua lại" từ đầu. Silver chạy lần tới sẽ upsert lại các user đó (MERGE idempotent theo key — chạy lại không nhân đôi). Spark/Flink job code mount qua volume nên không cần rebuild image processing.
+
+### 12.4. Câu hỏi tự kiểm tra bổ sung
+
+20. Schema-on-read đổi cái gì lấy cái gì? Field mới producer gửi thêm nằm ở đâu, và làm sao "khai quật" nó sau 1 tháng?
+21. Tại sao `(kafka_topic, kafka_partition, kafka_offset)` định danh duy nhất một message? Dùng nó để điều tra "message này có bị ghi 2 lần không" như thế nào?
+22. Khi nào dùng `from_json` + schema, khi nào dùng `get_json_object` + coalesce?
+23. Event DELETE của CDC giờ có mặt ở Bronze nhưng không ảnh hưởng Silver — filter nào chặn nó, ở file nào?
+24. Nếu muốn thêm nguồn `orders_created` vào hệ thống, phải sửa những file nào, mỗi file bao nhiêu dòng?

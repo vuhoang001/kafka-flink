@@ -19,23 +19,13 @@ def get_data():
     return res["results"][0]
 
 
-def format_data(res):
-    return {
-        "first_name": res["name"]["first"],
-        "last_name": res["name"]["last"],
-        "gender": res["gender"],
-        "postcode": str(res["location"]["postcode"]),
-        "email": res["email"],
-        "username": res["login"]["username"],
-        "dob": res["dob"]["date"],
-        "registered_date": res["registered"]["date"],
-        "phone": res["phone"],
-        "picture": res["picture"]["medium"],
-    }
-
-
 def stream_to_kafka():
-    """Fetch user data từ API và gửi liên tục vào Kafka topic 'users_created' trong 60 giây."""
+    """Fetch user data từ API và gửi NGUYÊN XI vào Kafka topic 'users_created' trong 60 giây.
+
+    Không format/chọn lọc field ở đây — gửi toàn bộ object randomuser trả về
+    (name, location, login, dob, registered, picture, nat, ...).
+    Bronze lưu raw, Silver mới chuẩn hoá schema.
+    """
     import json
 
     from kafka import KafkaProducer
@@ -51,9 +41,8 @@ def stream_to_kafka():
     while time.time() < end_time:
         try:
             raw = get_data()
-            user = format_data(raw)
-            producer.send("users_created", json.dumps(user).encode("utf-8"))
-            logging.info("Sent: %s %s", user["first_name"], user["last_name"])
+            producer.send("users_created", json.dumps(raw).encode("utf-8"))
+            logging.info("Sent raw user: %s", raw.get("email", "?"))
             time.sleep(1)
         except Exception as e:
             logging.error("Error: %s", e)

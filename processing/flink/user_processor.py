@@ -1,14 +1,19 @@
 """
-Flink Streaming Job — ghi raw data vào Bronze layer (Medallion Architecture).
+Flink Streaming Job — ghi RAW payload vào Bronze layer (schema-on-read).
 
 Catalog : Iceberg REST catalog (iceberg-rest:8181)
 Storage : MinIO s3://warehouse/ (S3FileIO từ iceberg-aws-bundle)
-Layer   : Bronze — lưu nguyên xi từ Kafka, thêm ingested_at để trace
+Layer   : Bronze — KHÔNG parse JSON. Mỗi Kafka message giữ nguyên xi trong cột
+          `payload`, kèm metadata Kafka (topic/partition/offset/timestamp) để
+          trace + dedup. Việc parse & chuẩn hoá schema là việc của Silver (Spark).
 
-Pipeline 1 (API):
-  Kafka [users_created]        → iceberg.bronze.api_users_raw
+Ưu điểm của thiết kế này:
+  - Producer thêm/bớt field thoải mái — Bronze không bao giờ vỡ schema.
+  - Không mất data: field nào cũng nằm trong payload, kể cả field chưa ai dùng.
+  - Thêm nguồn mới = thêm 1 dòng vào TOPICS, không phải viết pipeline mới.
 
-Pipeline 2 (CDC):
+Pipeline:
+  Kafka [users_created]         → iceberg.bronze.api_users_raw
   Kafka [postgres.public.users] → iceberg.bronze.cdc_users_raw
 
 Cách chạy:
@@ -26,6 +31,12 @@ AWS_ACCESS_KEY_ID      = os.environ.get("AWS_ACCESS_KEY_ID", "minio")
 AWS_SECRET_ACCESS_KEY  = os.environ.get("AWS_SECRET_ACCESS_KEY", "minio123")
 AWS_REGION             = os.environ.get("AWS_REGION", "us-east-1")
 KAFKA_BOOTSTRAP        = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "broker:29092")
+
+# topic Kafka → (tên bảng source tạm trong Flink, bảng Bronze, consumer group)
+TOPICS = {
+    "users_created":         ("api_source", "api_users_raw", "flink-api-group"),
+    "postgres.public.users": ("cdc_source", "cdc_users_raw", "flink-cdc-group"),
+}
 
 
 def main():
@@ -51,99 +62,55 @@ def main():
     """)
     t_env.execute_sql("CREATE DATABASE IF NOT EXISTS iceberg.bronze")
 
-    # ── Kafka sources ─────────────────────────────────────────────────────────
-    t_env.execute_sql(f"""
-        CREATE TABLE IF NOT EXISTS api_source (
-            first_name STRING,
-            last_name  STRING,
-            gender     STRING,
-            postcode   STRING,
-            email      STRING,
-            username   STRING,
-            dob        STRING,
-            phone      STRING,
-            picture    STRING
-        ) WITH (
-            'connector'                    = 'kafka',
-            'topic'                        = 'users_created',
-            'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
-            'properties.group.id'          = 'flink-api-group',
-            'scan.startup.mode'            = 'earliest-offset',
-            'format'                       = 'json'
-        )
-    """)
-
-    t_env.execute_sql(f"""
-        CREATE TABLE IF NOT EXISTS cdc_source (
-            after ROW<id INT, name STRING, email STRING, department STRING>,
-            op     STRING,
-            ts_ms  BIGINT
-        ) WITH (
-            'connector'                    = 'kafka',
-            'topic'                        = 'postgres.public.users',
-            'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
-            'properties.group.id'          = 'flink-cdc-group',
-            'scan.startup.mode'            = 'earliest-offset',
-            'format'                       = 'json',
-            'json.ignore-parse-errors'     = 'true'
-        )
-    """)
-
-    # ── Bronze sink tables ────────────────────────────────────────────────────
-    t_env.execute_sql("""
-        CREATE TABLE IF NOT EXISTS iceberg.bronze.api_users_raw (
-            first_name  STRING,
-            last_name   STRING,
-            gender      STRING,
-            postcode    STRING,
-            email       STRING,
-            username    STRING,
-            dob         STRING,
-            phone       STRING,
-            picture     STRING,
-            ingested_at TIMESTAMP(3)
-        ) WITH (
-            'format-version'       = '2',
-            'write.format.default' = 'parquet'
-        )
-    """)
-
-    t_env.execute_sql("""
-        CREATE TABLE IF NOT EXISTS iceberg.bronze.cdc_users_raw (
-            id           INT,
-            name         STRING,
-            email        STRING,
-            department   STRING,
-            op           STRING,
-            source_ts_ms BIGINT,
-            ingested_at  TIMESTAMP(3)
-        ) WITH (
-            'format-version'       = '2',
-            'write.format.default' = 'parquet'
-        )
-    """)
-
-    # ── Pipelines ─────────────────────────────────────────────────────────────
     stmt_set = t_env.create_statement_set()
 
-    stmt_set.add_insert_sql("""
-        INSERT INTO iceberg.bronze.api_users_raw
-        SELECT
-            first_name, last_name, gender, postcode,
-            email, username, dob, phone, picture,
-            CURRENT_TIMESTAMP
-        FROM default_catalog.default_database.api_source
-    """)
+    for topic, (source_table, bronze_table, group_id) in TOPICS.items():
+        # Source: 'format' = 'raw' → cả message thành 1 cột STRING, không parse.
+        # Các cột METADATA VIRTUAL do Kafka connector cung cấp, không nằm trong message.
+        t_env.execute_sql(f"""
+            CREATE TABLE IF NOT EXISTS {source_table} (
+                payload         STRING,
+                kafka_topic     STRING           METADATA FROM 'topic'     VIRTUAL,
+                kafka_partition INT              METADATA FROM 'partition' VIRTUAL,
+                kafka_offset    BIGINT           METADATA FROM 'offset'    VIRTUAL,
+                kafka_ts        TIMESTAMP_LTZ(3) METADATA FROM 'timestamp' VIRTUAL
+            ) WITH (
+                'connector'                    = 'kafka',
+                'topic'                        = '{topic}',
+                'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
+                'properties.group.id'          = '{group_id}',
+                'scan.startup.mode'            = 'earliest-offset',
+                'format'                       = 'raw'
+            )
+        """)
 
-    stmt_set.add_insert_sql("""
-        INSERT INTO iceberg.bronze.cdc_users_raw
-        SELECT
-            after.id, after.name, after.email, after.department,
-            op, ts_ms,
-            CURRENT_TIMESTAMP
-        FROM default_catalog.default_database.cdc_source
-        WHERE after IS NOT NULL
-    """)
+        t_env.execute_sql(f"""
+            CREATE TABLE IF NOT EXISTS iceberg.bronze.{bronze_table} (
+                payload         STRING,
+                kafka_topic     STRING,
+                kafka_partition INT,
+                kafka_offset    BIGINT,
+                kafka_ts        TIMESTAMP(3),
+                ingested_at     TIMESTAMP(3)
+            ) WITH (
+                'format-version'       = '2',
+                'write.format.default' = 'parquet'
+            )
+        """)
+
+        # Không WHERE, không transform — Bronze nhận tất cả, kể cả event DELETE
+        # của CDC (after=null) hay message "lạ". Lọc là việc của Silver.
+        stmt_set.add_insert_sql(f"""
+            INSERT INTO iceberg.bronze.{bronze_table}
+            SELECT
+                payload,
+                kafka_topic,
+                kafka_partition,
+                kafka_offset,
+                CAST(kafka_ts AS TIMESTAMP(3)),
+                CURRENT_TIMESTAMP
+            FROM default_catalog.default_database.{source_table}
+        """)
 
     stmt_set.execute()
 
