@@ -16,6 +16,7 @@
 10. [Lộ trình tự viết lại bằng tay](#10-lộ-trình-tự-viết-lại-bằng-tay)
 11. [Câu hỏi tự kiểm tra](#11-câu-hỏi-tự-kiểm-tra)
 12. [Bronze schema-on-read — thiết kế hiện tại](#12-bronze-schema-on-read--thiết-kế-hiện-tại)
+13. [Production hardening — catalog bền, checkpoint bền, maintenance](#13-production-hardening)
 
 > **Lưu ý (07/2026):** code đã được đổi sang **Bronze schema-on-read** — Bronze lưu nguyên payload JSON, không parse. Các snippet ở mục 3, 6, 7 minh hoạ phiên bản cũ (schema-on-write, vẫn đúng về khái niệm); thiết kế mới và lý do đổi xem [mục 12](#12-bronze-schema-on-read--thiết-kế-hiện-tại).
 
@@ -822,3 +823,75 @@ Flink job mới không có checkpoint cũ → `scan.startup.mode = earliest-offs
 22. Khi nào dùng `from_json` + schema, khi nào dùng `get_json_object` + coalesce?
 23. Event DELETE của CDC giờ có mặt ở Bronze nhưng không ảnh hưởng Silver — filter nào chặn nó, ở file nào?
 24. Nếu muốn thêm nguồn `orders_created` vào hệ thống, phải sửa những file nào, mỗi file bao nhiêu dòng?
+
+---
+
+## 13. Production hardening
+
+Ba nâng cấp đưa stack từ "demo chạy được" lên "sống sót qua restart". Cả ba đều đã áp dụng trong code.
+
+### 13.1. Catalog bền — metadata bảng lưu vào Postgres
+
+**Vấn đề:** `tabulario/iceberg-rest` mặc định lưu con trỏ "bảng X → metadata.json nào" trong SQLite **in-memory**. Restart container = quên sạch mọi bảng, trong khi file Parquet vẫn nằm trên MinIO thành "mồ côi" — data còn mà không engine nào biết đường đọc.
+
+**Giải pháp** (trong `docker-compose.yaml`, service `iceberg-rest`):
+
+```yaml
+CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+CATALOG_URI: jdbc:postgresql://postgres:5432/catalogdb
+CATALOG_JDBC_USER: ${POSTGRES_USER}
+CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD}
+```
+
+Quy tắc đặt tên env của image này: `CATALOG_` + tên property, `_` → `.`, `__` → `-` (nên `CATALOG_CATALOG__IMPL` = `catalog-impl`). Database `catalogdb` được tạo trong `init.sql`; JdbcCatalog tự tạo 2 bảng `iceberg_tables` + `iceberg_namespace_properties` lần đầu chạy. Postgres cũng được gắn volume (`postgres_data`) để chính nó bền — `init.sql` chỉ chạy lần đầu khi volume trống.
+
+**Kiểm chứng:** `docker compose restart iceberg-rest` rồi `SHOW TABLES FROM iceberg.bronze` — bảng vẫn còn. (Trước đây: biến mất.)
+
+### 13.2. Checkpoint Flink bền — ghi lên MinIO
+
+**Vấn đề:** checkpoint mặc định nằm trong RAM của jobmanager. Container chết → mất checkpoint → mất Kafka offset đã chốt → exactly-once chỉ còn là lời hứa.
+
+**Giải pháp** (thêm vào `FLINK_PROPERTIES` của cả jobmanager lẫn taskmanager):
+
+```yaml
+state.backend: hashmap
+state.checkpoints.dir: s3://warehouse/_flink/checkpoints
+state.savepoints.dir: s3://warehouse/_flink/savepoints
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+```
+
+- State vẫn tính trong RAM (`hashmap`) nhưng mỗi 30s **snapshot được ghi ra MinIO** dưới `_flink/checkpoints/<job-id>/chk-N/`.
+- `RETAIN_ON_CANCELLATION`: cancel job cũng không xoá checkpoint — để còn resume.
+- Flink đọc/ghi `s3://` qua plugin `s3-fs-hadoop` (đã cài trong Dockerfile) + các key `s3.endpoint/access-key/...` có sẵn trong FLINK_PROPERTIES.
+
+**Cách resume sau sự cố** — submit lại kèm `-s` trỏ vào checkpoint gần nhất:
+
+```bash
+docker exec minio ls /data/warehouse/_flink/checkpoints/<job-id>/   # tìm chk-N mới nhất
+docker exec flink-jobmanager flink run -d \
+  -s s3://warehouse/_flink/checkpoints/<job-id>/chk-N \
+  -py /opt/flink/jobs/user_processor.py
+```
+
+Job resume đọc tiếp từ đúng Kafka offset trong checkpoint — không mất, không trùng. (Submit mới không có `-s` thì đọc lại từ `earliest-offset` — vẫn đúng dữ liệu nhờ MERGE idempotent ở Silver, chỉ tốn công replay.)
+
+### 13.3. Maintenance định kỳ — gộp file nhỏ + xoá snapshot cũ
+
+**Vấn đề:** streaming commit mỗi 30s = mỗi ngày ~2.880 snapshot + hàng nghìn file Parquet bé cho mỗi bảng. Query chậm dần (mở nhiều file = nhiều round-trip S3), metadata phình.
+
+**Giải pháp:** job `processing/spark/jobs/maintenance.py` (chạy tay hoặc qua DAG `iceberg_maintenance` lúc 2h sáng hằng ngày), với mỗi bảng gọi 2 procedure:
+
+```sql
+CALL iceberg.system.rewrite_data_files(table => 'bronze.api_users_raw',
+     options => map('min-input-files', '5', 'target-file-size-bytes', '134217728'))
+CALL iceberg.system.expire_snapshots(table => 'bronze.api_users_raw',
+     older_than => TIMESTAMP '<7 ngày trước>', retain_last => 10)
+```
+
+- `rewrite_data_files`: đọc các file < ngưỡng, ghi lại thành file ~128MB, commit như một snapshot mới. Bảng đang được Flink ghi song song vẫn chạy được (optimistic concurrency) — nếu đụng nhau thì fail lần này, lần sau dọn bù, nên mỗi procedure bọc try/except riêng.
+- `expire_snapshots`: xoá snapshot cũ hơn 7 ngày (giữ tối thiểu 10 bản) **và các file chỉ thuộc snapshot đó**. Hệ quả cần biết: time-travel chỉ còn lùi được trong khoảng chưa expire.
+- Gold không cần dọn: `gold_transform` drop + tạo lại bảng mỗi lần chạy.
+
+### Checklist còn lại cho production thật
+
+Đã làm: catalog bền, checkpoint bền, maintenance, UNIQUE + upsert tại nguồn. Chưa làm (tự luyện tiếp): data quality check giữa Silver→Gold, alerting khi job fail (Airflow callback), Kafka nhiều broker + replication factor 3, secrets ra khỏi `.env` (Vault/SOPS), tách MinIO bucket cho checkpoint khỏi bucket warehouse.

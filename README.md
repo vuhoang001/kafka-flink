@@ -27,8 +27,9 @@ Pipeline xử lý dữ liệu realtime theo Medallion Architecture (Bronze → S
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                  BRONZE  (raw, append-only)                      │
+│            BRONZE  (raw payload JSON, schema-on-read)            │
 │  iceberg.bronze.api_users_raw    iceberg.bronze.cdc_users_raw   │
+│   mỗi dòng = 1 Kafka message nguyên xi + metadata + ingested_at  │
 │                 MinIO  s3://warehouse/  (Parquet)                │
 └──────────────────────────────┬───────────────────────────────────┘
                                │ Spark batch (15 phút)
@@ -85,6 +86,7 @@ Pipeline xử lý dữ liệu realtime theo Medallion Architecture (Bronze → S
 
 | Tài liệu | Mô tả |
 |----------|-------|
+| [Deep dive](docs/deep-dive.md) | **Đọc trước tiên** — giải thích từng dòng code, schema-on-read, production hardening, lộ trình tự viết lại |
 | [Kiến trúc chi tiết](docs/architecture.md) | Data flow, lý do chọn công nghệ, quyết định thiết kế |
 | [Setup & khởi động](docs/setup.md) | Cài đặt từng bước, requirements, verify |
 | [Test end-to-end](docs/testing.md) | Hướng dẫn test toàn bộ luồng có kèm lệnh |
@@ -109,16 +111,18 @@ realtime-data-streaming/
 │   │   ├── requirements.txt
 │   │   └── Dockerfile
 │   └── dags/
-│       └── spark_pipeline.py    # Airflow DAG: chạy Spark mỗi 15 phút
+│       ├── spark_pipeline.py        # Airflow DAG: Silver + Gold mỗi 15 phút
+│       └── maintenance_pipeline.py  # Airflow DAG: dọn Iceberg 2h sáng hằng ngày
 ├── processing/
 │   ├── flink/
-│   │   ├── user_processor.py    # Flink job: Kafka → Bronze Iceberg
+│   │   ├── user_processor.py    # Flink job: Kafka → Bronze (raw payload, generic)
 │   │   └── Dockerfile
 │   └── spark/
 │       ├── jobs/
 │       │   ├── spark_session.py         # Spark+Iceberg session builder
-│       │   ├── silver_transform.py      # Bronze → Silver (incremental MERGE)
-│       │   └── gold_transform.py        # Silver → Gold (full rebuild)
+│       │   ├── silver_transform.py      # Bronze → Silver (parse JSON + MERGE)
+│       │   ├── gold_transform.py        # Silver → Gold (full rebuild)
+│       │   └── maintenance.py           # Gộp file nhỏ + expire snapshots
 │       └── Dockerfile
 ├── storage/
 │   └── postgres/
@@ -150,12 +154,17 @@ docker compose up -d
 # 2. Submit Flink job
 docker exec flink-jobmanager flink run -d -py /opt/flink/jobs/user_processor.py
 
-# 3. Gửi thử dữ liệu qua API
+# 3a. Gửi dữ liệu thẳng vào Kafka (nhận JSON bất kỳ — schema-on-read)
 curl -X POST http://localhost:8888/users \
   -H "Content-Type: application/json" \
   -d '{"first_name":"Hoang","last_name":"Nguyen","gender":"male","postcode":"100000",
        "email":"hoang@example.com","username":"hoangnv",
        "dob":"1995-01-15","phone":"0901234567"}'
+
+# 3b. Ghi vào PostgreSQL → Debezium bắt CDC → Kafka (upsert theo email)
+curl -X POST http://localhost:8888/db/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Hoang Nguyen","email":"hoang@example.com","department":"Engineering"}'
 
 # 4. Đợi ~30s, query Bronze
 docker exec -it trino trino \
@@ -175,6 +184,12 @@ docker exec spark-master /opt/spark/bin/spark-submit \
 # 6. Query Gold
 docker exec -it trino trino \
   --execute "SELECT * FROM iceberg.gold.users_enriched LIMIT 5"
+
+# 7. (Định kỳ/hằng ngày) Dọn dẹp Iceberg: gộp file nhỏ + xoá snapshot cũ
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --py-files /opt/spark/jobs/spark_session.py \
+  /opt/spark/jobs/maintenance.py
 ```
 
 Chi tiết từng bước xem tại [docs/testing.md](docs/testing.md).

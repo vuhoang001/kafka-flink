@@ -1,5 +1,7 @@
 # Cách hoạt động của hệ thống — Giải thích toàn bộ luồng
 
+> **Lưu ý (07/2026):** tài liệu này mô tả phiên bản schema-on-write cũ (Flink parse JSON thành cột ngay tại Bronze). Code hiện tại đã chuyển sang **schema-on-read** (Bronze lưu payload nguyên xi, Silver mới parse) và thêm production hardening (catalog bền, checkpoint bền, maintenance). Bản cập nhật đầy đủ xem [deep-dive.md](deep-dive.md), đặc biệt mục 12–13. Các khái niệm nền (Kafka, CDC, checkpoint, Iceberg, Medallion) trong tài liệu này vẫn đúng.
+
 ## Mục lục
 1. [Tổng quan](#1-tổng-quan)
 2. [Nguồn dữ liệu](#2-nguồn-dữ-liệu--2-luồng-vào)
