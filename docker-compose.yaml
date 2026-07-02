@@ -46,6 +46,8 @@ services:
       POSTGRES_HOST_AUTH_METHOD: md5
     command: postgres -c wal_level=logical
     volumes:
+      # Data bền qua restart — init.sql chỉ chạy lần đầu khi volume còn trống
+      - postgres_data:/var/lib/postgresql/data
       - ./storage/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - confluent
@@ -160,6 +162,12 @@ services:
       CATALOG_S3_ENDPOINT: ${MINIO_ENDPOINT}
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
       CATALOG_S3_REGION: ${AWS_REGION}
+      # Metadata catalog lưu bền vào Postgres (mặc định là SQLite in-memory —
+      # restart container là quên sạch mọi bảng)
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://postgres:5432/catalogdb
+      CATALOG_JDBC_USER: ${POSTGRES_USER}
+      CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_REGION: ${AWS_REGION}
@@ -167,6 +175,8 @@ services:
       - confluent
     depends_on:
       minio:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8181'"]
@@ -310,6 +320,10 @@ services:
         s3.access-key: ${AWS_ACCESS_KEY_ID}
         s3.secret-key: ${AWS_SECRET_ACCESS_KEY}
         s3.path.style.access: true
+        state.backend: hashmap
+        state.checkpoints.dir: s3://${MINIO_BUCKET}/_flink/checkpoints
+        state.savepoints.dir: s3://${MINIO_BUCKET}/_flink/savepoints
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
     volumes:
       - ./processing/flink:/opt/flink/jobs
     networks:
@@ -344,6 +358,10 @@ services:
         s3.access-key: ${AWS_ACCESS_KEY_ID}
         s3.secret-key: ${AWS_SECRET_ACCESS_KEY}
         s3.path.style.access: true
+        state.backend: hashmap
+        state.checkpoints.dir: s3://${MINIO_BUCKET}/_flink/checkpoints
+        state.savepoints.dir: s3://${MINIO_BUCKET}/_flink/savepoints
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
     networks:
       - confluent
     depends_on:
@@ -354,3 +372,4 @@ networks:
 
 volumes:
   minio_data:
+  postgres_data:

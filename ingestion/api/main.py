@@ -62,8 +62,15 @@ def create_db_user(user: DbUserIn):
         # Kết nối mỗi request — đủ cho demo; production dùng connection pool.
         with psycopg2.connect(**_pg_config) as conn:
             with conn.cursor() as cur:
+                # email có UNIQUE constraint — POST trùng email = update thay vì
+                # tạo dòng mới, Debezium sẽ phát event op='u' thay vì op='c'
                 cur.execute(
-                    "INSERT INTO users (name, email, department) VALUES (%s, %s, %s) RETURNING id",
+                    """
+                    INSERT INTO users (name, email, department) VALUES (%s, %s, %s)
+                    ON CONFLICT (email) DO UPDATE
+                        SET name = EXCLUDED.name, department = EXCLUDED.department
+                    RETURNING id
+                    """,
                     (user.name, user.email, user.department),
                 )
                 new_id = cur.fetchone()[0]

@@ -1,12 +1,12 @@
--- Database riêng cho Nessie (Iceberg catalog metadata)
--- Phải tạo trước khi Nessie khởi động
-CREATE DATABASE nessiedb;
+-- Database riêng cho Iceberg REST catalog — lưu metadata bảng (con trỏ
+-- "bảng X → metadata.json mới nhất"). Có nó, restart iceberg-rest không mất bảng.
+CREATE DATABASE catalogdb;
 
 -- Bảng users: đây là source table mà Debezium sẽ theo dõi CDC
 CREATE TABLE users (
     id         SERIAL PRIMARY KEY,
     name       VARCHAR(100) NOT NULL,
-    email      VARCHAR(100) NOT NULL,
+    email      VARCHAR(100) NOT NULL UNIQUE,
     department VARCHAR(50)
 );
 
